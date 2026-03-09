@@ -32,7 +32,7 @@ import sys
 WIDTH, HEIGHT = 900, 600
 MARGIN        = 40
 
-h           = 1 / 120
+h           = 1 / 480
 mu_stick    = 0.3     # puck-body friction
 mu_wall     = 0.1     # wall-body friction
 mu_bb       = 0.2     # box-circle friction
@@ -41,14 +41,14 @@ mu_bb       = 0.2     # box-circle friction
 mass_box = 2.0 * 2.0
 size     = 80.0
 I_box    = (1.0 / 6.0) * mass_box * size ** 2
-B_LIN_BOX = mass_box * 2.0
-B_ROT_BOX = I_box    * 2.0
+B_LIN_BOX = mass_box * 7.0
+B_ROT_BOX = I_box    * 10.0
 
 # --- Circle / disk ---
 mass_circ  = 1.5
 CIRC_R     = 35.0
 # disk moment of inertia: 0.5 m r^2 (not used in DOF but kept for reference)
-B_LIN_CIRC = mass_circ * 2.0
+B_LIN_CIRC = mass_circ * 10.0
 
 # Combined mass matrix  (5 DOF: box x,y,theta  + circle x,y)
 M_all = np.diag([mass_box, mass_box, I_box, mass_circ, mass_circ])
@@ -287,11 +287,17 @@ def step(q_box, v_box, q_circ, v_circ, contacts):
             cp.Minimize(0.5 * cp.quad_form(v_var, M_all) + kbar @ v_var),
             [A_ineq @ v_var >= b_ineq]
         )
-        prob.solve(solver=cp.CLARABEL, verbose=False)
 
-        if prob.status in ("optimal", "optimal_inaccurate"):
-            v_next = v_var.value
-        else:
+        v_next = None
+        for solver in (cp.CLARABEL, cp.SCS, cp.ECOS):
+            try:
+                prob.solve(solver=solver, verbose=False)
+                if prob.status in ("optimal", "optimal_inaccurate") and v_var.value is not None:
+                    v_next = v_var.value
+                    break
+            except cp.error.SolverError:
+                continue
+        if v_next is None:
             v_next = v_all + h * (Minv @ f_all)
 
     v_box_next  = v_next[:3]

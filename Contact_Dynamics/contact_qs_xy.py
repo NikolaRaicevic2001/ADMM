@@ -39,12 +39,12 @@ CIRC_R  = 35.0
 
 # Regularisation matrix E
 E_BOX_LIN = 8.0
-E_BOX_ROT = 4.0
-E_CIRC    = 6.0
+E_BOX_ROT = 8.0
+E_CIRC    = 8.0
 E_all = np.diag([E_BOX_LIN, E_BOX_LIN, E_BOX_ROT, E_CIRC, E_CIRC])
 
 EPS_HAT = 2.0
-GAMMA   = 0.5
+GAMMA   = 0.75
 
 # Puck
 STICK_R     = 12.0

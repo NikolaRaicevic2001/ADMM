@@ -12,7 +12,7 @@ import sys
 WIDTH, HEIGHT = 900, 600
 MARGIN        = 40
 
-h           = 1 / 120
+h           = 1 / 480
 mu_stick    = 0.3
 mu_wall     = 0.1
 
@@ -30,7 +30,7 @@ GAMMA   = 0.5
 
 STICK_R     = 12.0
 STICK_SPEED = 350.0
-EPS_HAT     = 8.0
+EPS_HAT     = 2.0
 
 # =====================================================
 # Initial state

@@ -48,7 +48,7 @@ import sys
 # ══════════════════════════════════════════════════════
 WIDTH, HEIGHT = 900, 600
 
-h    = 1 / 120          # time step
+h    = 1 / 360          # time step
 g    = 900              # gravitational acceleration (pixels/s²), downward = +y
 mu   = 0.8              # Coulomb friction coefficient
 mass = 20.0
