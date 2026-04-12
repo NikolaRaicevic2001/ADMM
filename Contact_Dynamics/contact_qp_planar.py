@@ -1,24 +1,9 @@
 """
-Exact implementation of:
-  Anitescu, M. "Optimization-based simulation of nonsmooth rigid multibody dynamics."
-  Math. Program. 105, 113-143 (2006).  [ANL Preprint P1161]
+Anitescu, M. "Optimization-based simulation of nonsmooth rigid multibody dynamics."
+Math. Program. 105, 113-143 (2006).
 
-TOP-DOWN (tabletop) VIEW  -  two bodies: a square box and a circular disk.
-Both are driven by a kinematic puck (WASD).
-
-MULTI-BODY QP
-  Combined generalised velocity: v_all = [vx_box, vy_box, omega_box, vx_circ, vy_circ]
-  Combined mass matrix: M_all = diag(m_box, m_box, I_box, m_circ, m_circ)
-
-  For each contact the Jacobian row spans the full 5-DOF state:
-    kinematic obstacle -> single body:  row has zeros for the other body
-    box <-> circle:                     row has -J_box | +J_circ
-
-  min_{v+}  0.5 (v+)^T M_all v+  +  kbar^T v+
-  kbar = -M_all v^l - h f^l
-
-  subject to, for each active contact j:
-    (Jn^j +/- mu Jt^j) @ v+  +  gamma * phi^j / h  >= 0
+Top-down planar view. Two bodies (box + circle disk) driven by a kinematic puck (WASD).
+Combined 5-DOF state: v_all = [vx_box, vy_box, omega_box, vx_circ, vy_circ].
 """
 
 import pygame
@@ -26,68 +11,55 @@ import numpy as np
 import cvxpy as cp
 import sys
 
-# =====================================================
-# Simulation parameters
-# =====================================================
+# ── Simulation parameters ─────────────────────────────────────────────────────
 WIDTH, HEIGHT = 900, 600
 MARGIN        = 40
 
 h           = 1 / 480
-mu_stick    = 0.3     # puck-body friction
-mu_wall     = 0.1     # wall-body friction
-mu_bb       = 0.2     # box-circle friction
+mu_stick    = 0.3
+mu_wall     = 0.1
+mu_bb       = 0.2
 
-# --- Box ---
-mass_box = 2.0 * 2.0
-size     = 80.0
-I_box    = (1.0 / 6.0) * mass_box * size ** 2
+# Box
+mass_box  = 2.0 * 2.0
+size      = 80.0
+I_box     = (1.0 / 6.0) * mass_box * size ** 2
 B_LIN_BOX = mass_box * 7.0
 B_ROT_BOX = I_box    * 10.0
 
-# --- Circle / disk ---
+# Circle
 mass_circ  = 1.5
 CIRC_R     = 35.0
-# disk moment of inertia: 0.5 m r^2 (not used in DOF but kept for reference)
 B_LIN_CIRC = mass_circ * 10.0
 
-# Combined mass matrix  (5 DOF: box x,y,theta  + circle x,y)
+# Combined 5-DOF mass matrix [box x,y,theta | circle x,y]
 M_all = np.diag([mass_box, mass_box, I_box, mass_circ, mass_circ])
 Minv  = np.linalg.inv(M_all)
 
 EPS_HAT = 2.0
 GAMMA   = 0.2
 
-# Puck
 STICK_R     = 12.0
 STICK_SPEED = 350.0
 
-# =====================================================
-# Initial state
-# =====================================================
-# Box
-q_box = np.array([WIDTH / 2.0 - 120.0, HEIGHT / 2.0, 0.0])
-v_box = np.zeros(3)
-
-# Circle
+# ── Initial state ─────────────────────────────────────────────────────────────
+q_box  = np.array([WIDTH / 2.0 - 120.0, HEIGHT / 2.0, 0.0])
+v_box  = np.zeros(3)
 q_circ = np.array([WIDTH / 2.0 + 130.0, HEIGHT / 2.0])
 v_circ = np.zeros(2)
-
-# Puck
 stick_pos = np.array([WIDTH / 2.0 - 300.0, HEIGHT / 2.0])
 
-# =====================================================
-# Pygame
-# =====================================================
+# ── Pygame ────────────────────────────────────────────────────────────────────
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("Anitescu 2006 - top-down, two bodies")
 clock = pygame.time.Clock()
 font  = pygame.font.SysFont("monospace", 14)
 
+print(f"[contact_qp_planar] h={h:.5f}  mu_stick={mu_stick}  mu_bb={mu_bb}  gamma={GAMMA}  EPS_HAT={EPS_HAT}px")
 
-# =====================================================
-# Geometry helpers
-# =====================================================
+
+# ── Geometry ──────────────────────────────────────────────────────────────────
 
 def rotation_matrix(theta):
     c, s = np.cos(theta), np.sin(theta)
@@ -111,17 +83,9 @@ def closest_point_on_segment(p, a, b):
     return a + t * ab, t
 
 
-# =====================================================
-# Jacobian helpers
-# =====================================================
-# Full system DOF layout:
-#   indices 0,1,2  -> box  (vx, vy, omega)
-#   indices 3,4    -> circle (vx, vy)
-#
-# Jn/Jt are built as 5-vectors with zeros in the unused slots.
+# ── Jacobians over the full 5-DOF state (zeros in unused body slots) ──────────
 
 def jac_single_box(n, r):
-    """Jacobian rows for a contact on the BOX only (circle slots = 0)."""
     t  = np.array([-n[1], n[0]])
     Jn = np.array([n[0], n[1],  r[0]*n[1] - r[1]*n[0],  0.0, 0.0])
     Jt = np.array([t[0], t[1],  r[0]*t[1] - r[1]*t[0],  0.0, 0.0])
@@ -129,23 +93,16 @@ def jac_single_box(n, r):
 
 
 def jac_single_circ(n):
-    """Jacobian rows for a contact on the CIRCLE only (box slots = 0).
-    Circle has no rotation DOF, so contact velocity = CM velocity."""
     t  = np.array([-n[1], n[0]])
     Jn = np.array([0.0, 0.0, 0.0,  n[0], n[1]])
     Jt = np.array([0.0, 0.0, 0.0,  t[0], t[1]])
     return Jn, Jt
 
 
+# ── Box-circle Jacobian: Jn = [-J_box | +J_circ] (relative velocity constraint) ──
+
 def jac_box_vs_circ(n, r_box):
-    """
-    Jacobian for box-circle contact.
-    n points from box surface TOWARD circle (outward from box).
-    Non-penetration:  n^T v_circ_contact  -  n^T v_box_contact  >= -phi/h
-    => Jn_all = [-Jn_box | +Jn_circ]
-    """
     t = np.array([-n[1], n[0]])
-    # box part (negated because box is the obstacle from circle's perspective)
     Jn_box_part = np.array([n[0], n[1],  r_box[0]*n[1] - r_box[1]*n[0]])
     Jt_box_part = np.array([t[0], t[1],  r_box[0]*t[1] - r_box[1]*t[0]])
     Jn = np.concatenate([-Jn_box_part, [n[0], n[1]]])
@@ -153,19 +110,12 @@ def jac_box_vs_circ(n, r_box):
     return Jn, Jt
 
 
-# =====================================================
-# Contact detection
-# =====================================================
+# ── Contact detection: walls×box, walls×circ, puck×box, puck×circ, box×circ ──
 
 def detect_contacts(q_box, q_circ, stick_pos):
-    """
-    Returns list of (phi, Jn, Jt, mu_c).
-    Jacobians are already 5-vectors over the full combined state.
-    """
     contacts = []
     verts = get_box_vertices(q_box)
 
-    # ---- Walls vs Box (per vertex) -----------------------------------------
     for vtx in verts:
         r = vtx - q_box[:2]
 
@@ -189,7 +139,6 @@ def detect_contacts(q_box, q_circ, stick_pos):
             Jn, Jt = jac_single_box(np.array([0.0, -1.0]), r)
             contacts.append((phi, Jn, Jt, mu_wall))
 
-    # ---- Walls vs Circle (per face) ----------------------------------------
     cx, cy = q_circ
 
     phi = cx - CIRC_R - MARGIN
@@ -212,7 +161,6 @@ def detect_contacts(q_box, q_circ, stick_pos):
         Jn, Jt = jac_single_circ(np.array([0.0, -1.0]))
         contacts.append((phi, Jn, Jt, mu_wall))
 
-    # ---- Puck vs Box (per edge, closest point) -----------------------------
     edge_pairs = [(0,1), (1,2), (2,3), (3,0)]
     for i, j in edge_pairs:
         closest, _ = closest_point_on_segment(stick_pos, verts[i], verts[j])
@@ -225,24 +173,21 @@ def detect_contacts(q_box, q_circ, stick_pos):
             Jn, Jt = jac_single_box(n, r)
             contacts.append((phi, Jn, Jt, mu_stick))
 
-    # ---- Puck vs Circle (circle-circle) ------------------------------------
     delta = q_circ - stick_pos
     dist  = np.linalg.norm(delta)
     phi   = dist - STICK_R - CIRC_R
     if phi <= EPS_HAT and dist > 1e-6:
-        n = delta / dist       # outward: puck_centre -> circle_centre
+        n = delta / dist
         Jn, Jt = jac_single_circ(n)
         contacts.append((phi, Jn, Jt, mu_stick))
 
-    # ---- Box vs Circle -----------------------------------------------------
-    # Closest point on each box edge to the circle centre.
     for i, j in edge_pairs:
         closest, _ = closest_point_on_segment(q_circ, verts[i], verts[j])
         delta = q_circ - closest
         dist  = np.linalg.norm(delta)
         phi   = dist - CIRC_R
         if phi <= EPS_HAT and dist > 1e-6:
-            n = delta / dist   # outward from box edge -> circle centre
+            n = delta / dist
             r = closest - q_box[:2]
             Jn, Jt = jac_box_vs_circ(n, r)
             contacts.append((phi, Jn, Jt, mu_bb))
@@ -250,12 +195,9 @@ def detect_contacts(q_box, q_circ, stick_pos):
     return contacts
 
 
-# =====================================================
-# One-step multi-body QP
-# =====================================================
+# ── One-step 5-DOF QP with viscous damping; fallback solver chain ─────────────
 
 def step(q_box, v_box, q_circ, v_circ, contacts):
-    # Stack combined velocity and forces
     v_all = np.concatenate([v_box, v_circ])
 
     f_box  = np.array([-B_LIN_BOX  * v_box[0],
@@ -298,6 +240,7 @@ def step(q_box, v_box, q_circ, v_circ, contacts):
             except cp.error.SolverError:
                 continue
         if v_next is None:
+            print("[WARN] All solvers failed — falling back to free-flight")
             v_next = v_all + h * (Minv @ f_all)
 
     v_box_next  = v_next[:3]
@@ -309,9 +252,7 @@ def step(q_box, v_box, q_circ, v_circ, contacts):
     return q_box_next, v_box_next, q_circ_next, v_circ_next
 
 
-# =====================================================
-# Main loop
-# =====================================================
+# ── Main loop ─────────────────────────────────────────────────────────────────
 while True:
 
     for event in pygame.event.get():
@@ -331,35 +272,28 @@ while True:
     contacts = detect_contacts(q_box, q_circ, stick_pos)
     q_box, v_box, q_circ, v_circ = step(q_box, v_box, q_circ, v_circ, contacts)
 
-    # --- Rendering ----------------------------------------------------------
+    # ── Render ────────────────────────────────────────────────────────────────
     screen.fill((245, 235, 210))
 
-    # Table border
     pygame.draw.rect(screen, (100, 70, 40),
                      pygame.Rect(MARGIN, MARGIN, WIDTH-2*MARGIN, HEIGHT-2*MARGIN), 6)
 
-    # Box
     verts_draw = get_box_vertices(q_box).astype(int).tolist()
     pygame.draw.polygon(screen, (210, 80, 60), verts_draw)
     pygame.draw.polygon(screen, (110, 30, 20), verts_draw, 2)
-    # direction marker
     R   = rotation_matrix(q_box[2])
     tip = (q_box[:2] + R @ np.array([size * 0.38, 0])).astype(int)
     pygame.draw.line(screen, (255,255,255), tuple(q_box[:2].astype(int)), tuple(tip), 3)
 
-    # Circle
     ci = q_circ.astype(int)
     pygame.draw.circle(screen, (60, 180, 100), ci, int(CIRC_R))
     pygame.draw.circle(screen, (20, 100,  50), ci, int(CIRC_R), 2)
-    # small dot at centre so you can see it's moved
     pygame.draw.circle(screen, (20, 100,  50), ci, 4)
 
-    # Puck
     sc = stick_pos.astype(int)
     pygame.draw.circle(screen, (50, 90, 210), sc, int(STICK_R))
     pygame.draw.circle(screen, (20, 40, 130), sc, int(STICK_R), 2)
 
-    # HUD
     nc = len(contacts)
     hud = [
         "Anitescu 2006 - top-down  |  red=box  green=circle  blue=puck",

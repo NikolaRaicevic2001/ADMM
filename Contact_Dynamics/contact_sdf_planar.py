@@ -1,54 +1,55 @@
 """
-ContactSDF (Yang & Jin, IEEE RA-L 2024)
-  https://arxiv.org/pdf/2408.09612
+Yang & Jin, "ContactSDF," IEEE RA-L 2024. https://arxiv.org/pdf/2408.09612
 
-TOP-DOWN tabletop demo: circular disk only, driven by a puck (WASD).
+Top-down planar view. Single circle disk driven by a kinematic puck (WASD).
+No QP solver: velocity is computed via log-sum-exp smoothing of the D-SDF
+halfspace set, then projected by Q^{-1/2}. Closed-form, differentiable.
 """
 
 import pygame
 import numpy as np
 import sys
 
+# ── Simulation parameters ─────────────────────────────────────────────────────
 WIDTH, HEIGHT = 900, 600
 MARGIN        = 40
 
-h           = 1 / 480
-mu_stick    = 0.3
-mu_wall     = 0.1
+h         = 1 / 480
+mu_stick  = 0.3
+mu_wall   = 0.1
 
-CIRC_R  = 35.0
+CIRC_R = 35.0
 
-E_CIRC  = 6.0
-E_diag  = np.array([E_CIRC, E_CIRC])
-
+# Compliance matrix Q = E / h^2; Q^{1/2} and Q^{-1/2} used in D-SDF projection
+E_CIRC       = 6.0
+E_diag       = np.array([E_CIRC, E_CIRC])
 Q_diag       = E_diag / h**2
 Q_half_diag  = np.sqrt(Q_diag)
 Q_half_inv   = 1.0 / Q_half_diag
 
-SIGMA_D = 4.0
+SIGMA_D = 4.0    # log-sum-exp smoothing temperature (higher = harder contact)
 GAMMA   = 0.5
 
 STICK_R     = 12.0
 STICK_SPEED = 350.0
 EPS_HAT     = 2.0
 
-# =====================================================
-# Initial state
-# =====================================================
-q_circ = np.array([WIDTH / 2.0, HEIGHT / 2.0])
-
+# ── Initial state ─────────────────────────────────────────────────────────────
+q_circ         = np.array([WIDTH / 2.0, HEIGHT / 2.0])
 stick_pos      = np.array([WIDTH / 2.0 - 200.0, HEIGHT / 2.0])
 stick_pos_prev = stick_pos.copy()
 
-# =====================================================
-# Pygame
-# =====================================================
+# ── Pygame ────────────────────────────────────────────────────────────────────
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("ContactSDF - circle only")
 clock = pygame.time.Clock()
 font  = pygame.font.SysFont("monospace", 14)
 
+print(f"[contact_sdf_planar] h={h:.5f}  sigma_d={SIGMA_D}  gamma={GAMMA}  EPS_HAT={EPS_HAT}px")
+
+
+# ── SDF and Jacobian helpers ──────────────────────────────────────────────────
 
 def csdf_circle(x_query, center, radius):
     delta = x_query - center
@@ -64,10 +65,11 @@ def jac_circ(n):
     return Jn, Jt
 
 
+# ── Contact detection: walls + puck (puck b_offset = n·v_puck) ───────────────
+
 def detect_contacts(q_circ, stick_pos, stick_vel):
     contacts = []
 
-    # ---- Walls vs Circle ----------------------------------------------------
     cx, cy = q_circ
     for phi_val, n_vec in [
         (cx - CIRC_R - MARGIN,             np.array([ 1.,  0.])),
@@ -80,7 +82,6 @@ def detect_contacts(q_circ, stick_pos, stick_vel):
             phi_eff = GAMMA * phi_val
             contacts.append((phi_eff, Jn, Jt, mu_wall))
 
-    # ---- Puck vs Circle -----------------------------------------------------
     phi_pc, n_pc = csdf_circle(q_circ, stick_pos, STICK_R + CIRC_R)
     if phi_pc <= EPS_HAT and np.linalg.norm(n_pc) > 1e-8:
         b_offset = float(n_pc @ stick_vel)
@@ -90,6 +91,8 @@ def detect_contacts(q_circ, stick_pos, stick_vel):
 
     return contacts
 
+
+# ── D-SDF step: LSE over halfspace set → gradient → Q^{-1/2} projection ──────
 
 def dsdf_step(contacts):
     z_query = np.zeros(2)
@@ -127,9 +130,7 @@ def dsdf_step(contacts):
     return Q_half_inv * z_plus / h
 
 
-# =====================================================
-# Main loop
-# =====================================================
+# ── Main loop ─────────────────────────────────────────────────────────────────
 while True:
 
     for event in pygame.event.get():
@@ -152,22 +153,19 @@ while True:
 
     contacts = detect_contacts(q_circ, stick_pos, stick_vel)
     v_next   = dsdf_step(contacts)
+    q_circ   = q_circ + h * v_next
 
-    q_circ = q_circ + h * v_next
-
-    # ---- Rendering ----------------------------------------------------------
+    # ── Render ────────────────────────────────────────────────────────────────
     screen.fill((210, 230, 250))
 
     pygame.draw.rect(screen, (50, 80, 130),
                      pygame.Rect(MARGIN, MARGIN, WIDTH-2*MARGIN, HEIGHT-2*MARGIN), 6)
 
-    # Circle
     ci = q_circ.astype(int)
     pygame.draw.circle(screen, (60, 180, 100), ci, int(CIRC_R))
     pygame.draw.circle(screen, (20, 100,  50), ci, int(CIRC_R), 2)
     pygame.draw.circle(screen, (20, 100,  50), ci, 4)
 
-    # Puck
     sc = stick_pos.astype(int)
     pygame.draw.circle(screen, (50, 90, 210), sc, int(STICK_R))
     pygame.draw.circle(screen, (20, 40, 130), sc, int(STICK_R), 2)

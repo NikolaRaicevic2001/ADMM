@@ -1,12 +1,20 @@
+"""
+ADMM-MPC planar manipulation using ContactSDF as the planning model.
+Yang & Jin, "ContactSDF," IEEE RA-L 2024.
+
+Planning: FD gradient of traj_cost, ADMM with speed-ball projection.
+Three phases: admm (MPC active) -> return (APF) -> done.
+Near-goal ADMM bypass: when dist < ADMM_BYPASS_THRESH, FD gradients are too
+noisy to trust; puck locks to push_dir at full speed instead.
+"""
+
 import pygame
 import numpy as np
 import sys
 import cv2
 import pathlib
 
-# ═══════════════════════════════════════════════════════════════════════
-#  PHYSICS CONSTANTS
-# ═══════════════════════════════════════════════════════════════════════
+# ── Physics constants ─────────────────────────────────────────────────────────
 WIDTH, HEIGHT = 900, 600
 MARGIN        = 40
 h             = 1 / 240
@@ -26,9 +34,7 @@ STICK_R       = 12.0
 STICK_SPEED   = 500.0
 EPS_HAT       = 8.0
 
-# ═══════════════════════════════════════════════════════════════════════
-#  SCENARIO
-# ═══════════════════════════════════════════════════════════════════════
+# ── Scenario ──────────────────────────────────────────────────────────────────
 Q_GOAL       = np.array([680.0, 310.0])
 Q_CIRC_INIT  = np.array([WIDTH / 2.0, HEIGHT / 2.0])
 PUCK_INIT    = np.array([200.0, 430.0])
@@ -38,9 +44,7 @@ OBS_CENTERS  = [np.array([535.0, 165.0]),
                 np.array([565.0, 415.0])]
 OBS_RADII    = [40.0, 35.0]
 
-# ═══════════════════════════════════════════════════════════════════════
-#  ADMM / MPC HYPERPARAMETERS
-# ═══════════════════════════════════════════════════════════════════════
+# ── ADMM / MPC hyper-parameters ───────────────────────────────────────────────
 N_HORIZON    = 15
 ADMM_ITERS   = 10
 ALPHA_V      = 20.0
@@ -48,32 +52,28 @@ RHO          = 0.05
 
 P_WEIGHT     = 10.0
 
-# ── FIX 1: APPROACH_W fade ────────────────────────────────────────────
-# APPROACH_W is full strength when dist_goal > APPROACH_FADE_START,
-# then linearly decays to 0 at APPROACH_FADE_END.
-# This stops the puck oscillating when the circle is almost at the goal.
-APPROACH_W          = 0.75
-APPROACH_FADE_START = 120.0   # px — begin fading here
-APPROACH_FADE_END   =  30.0   # px — fully off here (just keep pushing)
+# Below ADMM_BYPASS_THRESH: skip planning and push straight through
+APPROACH_W         = 0.75
+ADMM_BYPASS_THRESH = 20.0   # px
 
-# ── FIX 2: circle obstacle repulsion cost ────────────────────────────
-# Same soft-penalty form as PUCK_OBS_W but applied to the planned circle
-# trajectory so the optimizer routes the push path around obstacles.
-PUCK_OBS_W      = 1000.0   # puck ↔ obstacle repulsion (existing)
-CIRC_OBS_W      = 2000.0   # circle ↔ obstacle repulsion (NEW)
-OBS_MARGIN      = 14.0     # puck clearance (px beyond obs_r + STICK_R)
-CIRC_OBS_MARGIN = 10.0     # circle clearance (px beyond obs_r + CIRC_R)
+# Soft-penalty repulsion: circle and puck kept clear of static obstacles
+PUCK_OBS_W      = 1000.0
+CIRC_OBS_W      = 2000.0
+OBS_MARGIN      = 14.0     # puck clearance beyond obs_r + STICK_R
+CIRC_OBS_MARGIN = 10.0     # circle clearance beyond obs_r + CIRC_R
 
 S_WEIGHT     = 0.0
-FD_EPS       = 10.0
+FD_EPS       = 50.0
 NORM_THRESH  = 1e-4
 GOAL_THRESH  = 10.0
 RETURN_THRESH= 5.0
 KP_RETURN    = 8.0
 
-# ═══════════════════════════════════════════════════════════════════════
-#  PHYSICS HELPERS
-# ═══════════════════════════════════════════════════════════════════════
+print(f"[admm_sdf_planar] N={N_HORIZON}  admm_iters={ADMM_ITERS}  FD_EPS={FD_EPS}")
+print(f"  goal={Q_GOAL}  bypass_thresh={ADMM_BYPASS_THRESH}px  GOAL_THRESH={GOAL_THRESH}px")
+
+
+# ── ContactSDF physics helpers ────────────────────────────────────────────────
 
 def csdf_circle(x_query, center, radius):
     delta = x_query - center
@@ -92,6 +92,7 @@ def detect_contacts(q_circ, stick_pos, stick_vel):
     contacts = []
     cx, cy   = q_circ
 
+    # Wall contacts (b_offset = 0; walls are stationary)
     for phi_val, n_vec in [
         (cx - CIRC_R - MARGIN,              np.array([ 1.,  0.])),
         ((WIDTH  - MARGIN) - (cx + CIRC_R), np.array([-1.,  0.])),
@@ -102,12 +103,14 @@ def detect_contacts(q_circ, stick_pos, stick_vel):
             Jn, Jt = jac_circ(n_vec)
             contacts.append((GAMMA * phi_val, Jn, Jt, mu_wall))
 
+    # Static circular obstacles (frictionless)
     for obs_c, obs_r in zip(OBS_CENTERS, OBS_RADII):
         phi_obs, n_obs = csdf_circle(q_circ, obs_c, CIRC_R + obs_r)
         if phi_obs <= EPS_HAT and np.linalg.norm(n_obs) > 1e-8:
             Jn, Jt = jac_circ(n_obs)
             contacts.append((GAMMA * phi_obs, Jn, Jt, 0.0))
 
+    # Puck contact: b_offset = n·v_puck accounts for moving obstacle
     phi_pc, n_pc = csdf_circle(q_circ, stick_pos, STICK_R + CIRC_R)
     if phi_pc <= EPS_HAT and np.linalg.norm(n_pc) > 1e-8:
         b_offset = float(n_pc @ stick_vel)
@@ -143,9 +146,8 @@ def dsdf_step(contacts):
     z_plus    = z_query - d_sdf * grad
     return Q_half_inv * z_plus / h
 
-# ═══════════════════════════════════════════════════════════════════════
-#  GEOMETRY
-# ═══════════════════════════════════════════════════════════════════════
+
+# ── Geometry helpers ──────────────────────────────────────────────────────────
 
 def push_dir(q):
     d = Q_GOAL - q
@@ -159,9 +161,8 @@ def clamp_puck(pos):
                    [MARGIN + STICK_R,         MARGIN + STICK_R],
                    [WIDTH - MARGIN - STICK_R, HEIGHT - MARGIN - STICK_R])
 
-# ═══════════════════════════════════════════════════════════════════════
-#  ROLLOUT
-# ═══════════════════════════════════════════════════════════════════════
+
+# ── Trajectory rollout ────────────────────────────────────────────────────────
 
 def rollout(q0, u0, V):
     q, u  = q0.copy(), u0.copy()
@@ -174,9 +175,8 @@ def rollout(q0, u0, V):
         u_seq.append(u.copy())
     return np.array(q_seq), np.array(u_seq)
 
-# ═══════════════════════════════════════════════════════════════════════
-#  COST
-# ═══════════════════════════════════════════════════════════════════════
+
+# ── Trajectory cost: terminal + approach + obstacle repulsion (circle + puck) ─
 
 def traj_cost(q0, u0, V):
     """
@@ -188,26 +188,14 @@ def traj_cost(q0, u0, V):
     """
     q_seq, u_seq = rollout(q0, u0, V)
 
-    # Terminal circle-to-goal
     dqN = q_seq[-1] - Q_GOAL
     J   = P_WEIGHT * float(dqN @ dqN)
 
-    # ── FIX 1: fade APPROACH_W as circle nears goal ───────────────────
-    dist_goal = np.linalg.norm(q0 - Q_GOAL)
-    if dist_goal >= APPROACH_FADE_START:
-        aw_eff = APPROACH_W
-    elif dist_goal <= APPROACH_FADE_END:
-        aw_eff = 0.0
-    else:
-        t      = (dist_goal - APPROACH_FADE_END) / (APPROACH_FADE_START - APPROACH_FADE_END)
-        aw_eff = APPROACH_W * t
-
-    if aw_eff > 0.0:
+    if APPROACH_W > 0.0:
         pp  = push_pos(q0)
         duN = u_seq[-1] - pp
-        J  += aw_eff * float(duN @ duN)
+        J  += APPROACH_W * float(duN @ duN)
 
-    # ── FIX 2: circle obstacle repulsion (every planned step) ─────────
     if CIRC_OBS_W > 0.0:
         for qk in q_seq:
             for obs_c, obs_r in zip(OBS_CENTERS, OBS_RADII):
@@ -215,7 +203,6 @@ def traj_cost(q0, u0, V):
                 if clr < 0.0:
                     J += CIRC_OBS_W * clr * clr
 
-    # Puck obstacle repulsion (every planned step, unchanged from v3)
     if PUCK_OBS_W > 0.0:
         for uk in u_seq:
             for obs_c, obs_r in zip(OBS_CENTERS, OBS_RADII):
@@ -228,9 +215,8 @@ def traj_cost(q0, u0, V):
 
     return J
 
-# ═══════════════════════════════════════════════════════════════════════
-#  FD GRADIENT
-# ═══════════════════════════════════════════════════════════════════════
+
+# ── FD gradient of traj_cost w.r.t. velocity sequence V ──────────────────────
 
 def grad_fd(q0, u0, V):
     g  = np.zeros_like(V)
@@ -242,9 +228,8 @@ def grad_fd(q0, u0, V):
             g[k, d]  = (traj_cost(q0, u0, Vp) - J0) / FD_EPS
     return g
 
-# ═══════════════════════════════════════════════════════════════════════
-#  SPEED-BALL PROJECTION
-# ═══════════════════════════════════════════════════════════════════════
+
+# ── Project each row of V onto L2 ball of radius max_speed ───────────────────
 
 def proj_ball(V, max_speed):
     Z  = V.copy()
@@ -254,9 +239,8 @@ def proj_ball(V, max_speed):
             Z[k] = V[k] * (max_speed / nm[k])
     return Z
 
-# ═══════════════════════════════════════════════════════════════════════
-#  ADMM SOLVER
-# ═══════════════════════════════════════════════════════════════════════
+
+# ── ADMM solver: V-update (gradient step) + Z-update (projection) + dual ─────
 
 def admm_solve(q0, u0, V_init):
     V   = V_init.copy()
@@ -277,9 +261,8 @@ def admm_solve(q0, u0, V_init):
 
     return Z
 
-# ═══════════════════════════════════════════════════════════════════════
-#  STATE
-# ═══════════════════════════════════════════════════════════════════════
+
+# ── Simulation state ──────────────────────────────────────────────────────────
 q_circ     = Q_CIRC_INIT.copy()
 stick_pos  = PUCK_INIT.copy()
 stick_prev = PUCK_INIT.copy()
@@ -289,20 +272,17 @@ V_last     = None
 plan_q     = None
 plan_u     = None
 
-# ═══════════════════════════════════════════════════════════════════════
-#  PYGAME INIT
-# ═══════════════════════════════════════════════════════════════════════
+# ── Pygame init + video writer ────────────────────────────────────────────────
 pygame.init()
 screen = pygame.display.set_mode((WIDTH, HEIGHT))
 pygame.display.set_caption("ADMM-MPC  |  ContactSDF v4  |  Obstacle-Aware")
 clock  = pygame.time.Clock()
 font   = pygame.font.SysFont("monospace", 14)
 
-# ── Video recording ───────────────────────────────────────────────────────────
 results_dir = pathlib.Path(__file__).parent / "results"
-results_dir.mkdir(exist_ok=True)  # Create folder if it doesn't exist
+results_dir.mkdir(exist_ok=True)
 
-_video_path = results_dir / "admm_recording_sdf.mp4"
+_video_path = results_dir / "admm_recording_sdf_final.mp4"
 _fourcc     = cv2.VideoWriter_fourcc(*"mp4v")
 _video      = cv2.VideoWriter(str(_video_path), _fourcc, 45, (WIDTH, HEIGHT))
 
@@ -315,9 +295,7 @@ pygame.draw.circle(goal_surf, (220, 55, 55, 255), (_R+4, _R+4), _R, 4)
 overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
 dragging_obs = None
 
-# ═══════════════════════════════════════════════════════════════════════
-#  MAIN LOOP
-# ═══════════════════════════════════════════════════════════════════════
+# ── Main loop ─────────────────────────────────────────────────────────────────
 while True:
 
     for event in pygame.event.get():
@@ -342,28 +320,33 @@ while True:
 
     stick_prev = stick_pos.copy()
 
-    # ── ADMM MPC ──────────────────────────────────────────────────────
     if phase == "admm":
-        pdir = push_dir(q_circ)
+        pdir      = push_dir(q_circ)
+        dist_goal = np.linalg.norm(q_circ - Q_GOAL)
 
-        if V_prev is not None:
-            V_warm = np.vstack([V_prev[1:], [pdir * STICK_SPEED]])
+        if dist_goal < ADMM_BYPASS_THRESH:
+            # FD gradient too noisy this close; commit to straight push
+            V_last    = pdir * STICK_SPEED
+            plan_q    = None
+            plan_u    = None
         else:
-            V_warm = np.tile(pdir * STICK_SPEED, (N_HORIZON, 1)).astype(float)
+            if V_prev is not None:
+                V_warm = np.vstack([V_prev[1:], [pdir * STICK_SPEED]])
+            else:
+                V_warm = np.tile(pdir * STICK_SPEED, (N_HORIZON, 1)).astype(float)
 
-        Z_opt  = admm_solve(q_circ, stick_pos, V_warm)
-        V_prev = Z_opt.copy()
+            Z_opt  = admm_solve(q_circ, stick_pos, V_warm)
+            V_prev = Z_opt.copy()
+            plan_q, plan_u = rollout(q_circ, stick_pos, Z_opt)
+            V_last = Z_opt[0].copy()
 
-        plan_q, plan_u = rollout(q_circ, stick_pos, Z_opt)
-
-        V_last    = Z_opt[0].copy()
         stick_pos = clamp_puck(stick_pos + h * V_last)
 
-        if np.linalg.norm(q_circ - Q_GOAL) < GOAL_THRESH:
+        if dist_goal < GOAL_THRESH:
             phase  = "return"
             V_prev = None
+            print("[ADMM] Goal reached — APF return engaged.")
 
-    # ── Return phase ──────────────────────────────────────────────────
     elif phase == "return":
         err  = PUCK_RETURN - stick_pos
         dist = np.linalg.norm(err)
@@ -375,20 +358,18 @@ while True:
         stick_pos = clamp_puck(stick_pos + h * stick_vel)
         if dist < RETURN_THRESH:
             phase = "done"
+            print("[APF]  Puck returned home. Done.")
 
-    # ── Real physics step ──────────────────────────────────────────────
+    # Real physics step (runs every frame regardless of phase)
     stick_vel_real = (stick_pos - stick_prev) / h
     contacts       = detect_contacts(q_circ, stick_pos, stick_vel_real)
     q_circ         = q_circ + h * dsdf_step(contacts)
 
-    # ══════════════════════════════════════════════════════════════════
-    #  RENDER
-    # ══════════════════════════════════════════════════════════════════
+    # ── Render ────────────────────────────────────────────────────────────────
     screen.fill((210, 230, 250))
     pygame.draw.rect(screen, (50, 80, 130),
                      pygame.Rect(MARGIN, MARGIN, WIDTH-2*MARGIN, HEIGHT-2*MARGIN), 6)
 
-    # ── Planned horizon ghosts ────────────────────────────────────────
     if plan_q is not None and phase == "admm":
         overlay.fill((0, 0, 0, 0))
         N = len(plan_q) - 1
@@ -419,33 +400,28 @@ while True:
 
         screen.blit(overlay, (0, 0))
 
-    # ── Goal ghost ────────────────────────────────────────────────────
     gx, gy = int(Q_GOAL[0]), int(Q_GOAL[1])
     screen.blit(goal_surf, (gx - _R - 4, gy - _R - 4))
     pygame.draw.line(screen, (220, 55, 55), (gx-14, gy), (gx+14, gy), 2)
     pygame.draw.line(screen, (220, 55, 55), (gx, gy-14), (gx, gy+14), 2)
 
-    # ── Obstacles ─────────────────────────────────────────────────────
     for idx, (obs_c, obs_r) in enumerate(zip(OBS_CENTERS, OBS_RADII)):
         oc = (int(obs_c[0]), int(obs_c[1]))
         r  = int(obs_r)
         pygame.draw.circle(screen, (190, 75, 75), oc, r)
         rim_col = (255, 220, 100) if idx == dragging_obs else (110, 25, 25)
         pygame.draw.circle(screen, rim_col, oc, r, 3)
-        # Circle clearance ring (CIRC_R + obs_r + CIRC_OBS_MARGIN)
+        # Clearance rings: pink = circle, purple = puck
         pygame.draw.circle(screen, (215, 110, 110),
                            oc, int(obs_r + CIRC_R + CIRC_OBS_MARGIN), 1)
-        # Puck clearance ring (STICK_R + obs_r + OBS_MARGIN)
         pygame.draw.circle(screen, (160, 160, 230),
                            oc, int(obs_r + STICK_R + OBS_MARGIN), 1)
         lbl = font.render(f"obs{idx+1}", True, (255, 230, 200))
         screen.blit(lbl, (oc[0] - 14, oc[1] - 7))
 
-    # ── Puck home marker ──────────────────────────────────────────────
     rx, ry = int(PUCK_RETURN[0]), int(PUCK_RETURN[1])
     pygame.draw.circle(screen, (100, 110, 200), (rx, ry), int(STICK_R), 2)
 
-    # ── Push-point crosshair ──────────────────────────────────────────
     if phase == "admm":
         pp = push_pos(q_circ).astype(int)
         pygame.draw.line(screen, (180, 140, 60),
@@ -453,7 +429,6 @@ while True:
         pygame.draw.line(screen, (180, 140, 60),
                          (pp[0], pp[1]-11), (pp[0], pp[1]+11), 2)
 
-    # ── Applied velocity arrow ────────────────────────────────────────
     if phase == "admm" and V_last is not None:
         vmag = np.linalg.norm(V_last)
         if vmag > 1.0:
@@ -462,13 +437,11 @@ while True:
             tip  = (sc + vdir * 30).astype(int)
             pygame.draw.line(screen, (255, 200, 50), tuple(sc), tuple(tip), 3)
 
-    # ── Circle ────────────────────────────────────────────────────────
     ci = q_circ.astype(int)
     pygame.draw.circle(screen, (60, 180, 100), tuple(ci), _R)
     pygame.draw.circle(screen, (20, 100,  50), tuple(ci), _R, 2)
     pygame.draw.circle(screen, (20, 100,  50), tuple(ci), 4)
 
-    # ── Puck ──────────────────────────────────────────────────────────
     puck_col = {"admm":   (50,  90, 210),
                 "return": (190, 120,  40),
                 "done":   (110, 110, 110)}.get(phase, (50, 90, 210))
@@ -476,20 +449,11 @@ while True:
     pygame.draw.circle(screen, puck_col,      tuple(sc), int(STICK_R))
     pygame.draw.circle(screen, (20, 40, 130), tuple(sc), int(STICK_R), 2)
 
-    # ── HUD ───────────────────────────────────────────────────────────
     dist_goal = np.linalg.norm(q_circ - Q_GOAL)
     sv_mag    = np.linalg.norm(stick_vel_real)
     vL_str = (f"({V_last[0]:.0f},{V_last[1]:.0f})"
               f"  |{np.linalg.norm(V_last):.0f}|"
               if V_last is not None else "—")
-
-    # Compute effective APPROACH_W for HUD display
-    if dist_goal >= APPROACH_FADE_START:
-        aw_disp = APPROACH_W
-    elif dist_goal <= APPROACH_FADE_END:
-        aw_disp = 0.0
-    else:
-        aw_disp = APPROACH_W * (dist_goal - APPROACH_FADE_END) / (APPROACH_FADE_START - APPROACH_FADE_END)
 
     for i, txt in enumerate([
         "ADMM-MPC  |  ContactSDF v4  |  obstacle-aware",
@@ -503,13 +467,13 @@ while True:
         f"Contacts      : {len(contacts)}",
         f"N={N_HORIZON}  L={ADMM_ITERS}  α={ALPHA_V}"
         f"  ρ={RHO}  FD={FD_EPS}",
-        f"APPROACH_W    : {aw_disp:.3f}  (fades {APPROACH_FADE_START:.0f}→{APPROACH_FADE_END:.0f} px)",
-        f"CIRC_OBS_W    : {CIRC_OBS_W:.0f}  (NEW: circle path avoidance)",
+        f"BYPASS        : {'YES (pushing through)' if dist_goal < ADMM_BYPASS_THRESH else 'no'}"
+        f"  thresh={ADMM_BYPASS_THRESH:.0f}px",
+        f"CIRC_OBS_W    : {CIRC_OBS_W:.0f}  (circle path avoidance)",
         "Drag red circles to reposition obstacles",
     ]):
         screen.blit(font.render(txt, True, (20, 40, 90)), (10, 10 + i*17))
 
-    # ── Legend ────────────────────────────────────────────────────────
     for i, (lbl, col) in enumerate([
         ("● circle",      (60,  180, 100)),
         ("◎ goal",        (220,  55,  55)),
@@ -527,9 +491,8 @@ while True:
 
     pygame.display.flip()
 
-    # Capture frame for video
-    _frame = pygame.surfarray.array3d(screen)          # (W, H, 3) RGB
-    _frame = np.transpose(_frame, (1, 0, 2))           # → (H, W, 3)
+    _frame = pygame.surfarray.array3d(screen)
+    _frame = np.transpose(_frame, (1, 0, 2))
     _video.write(cv2.cvtColor(_frame, cv2.COLOR_RGB2BGR))
 
     clock.tick(30)
