@@ -1,4 +1,8 @@
-"""Object-level subproblem: sample (p_c, f_n, f_t) → world CoM wrench → MPPI."""
+"""Object-level subproblem: MPPI over contact actions (p_c, f_n, f_t).
+
+Action vector per timestep is a_t = [p_x, p_y, f_n, f_t] in the object body frame.
+Wrenches are derived via J_c^T f_c inside the rollout — never sampled directly.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +15,8 @@ from contact.wrench_map import contact_force_to_com_wrench
 from dynamics.object_2d import QuasiStaticObject2D
 from dynamics.obstacles import obstacle_cost
 from geometry.base_sdf import BaseSDF
+from mppi.mppi_core import MPPIOptimizer
+from mppi.sampler import GaussianSampler
 from utils.math_utils import goal_cost, rotate, softmax
 
 
@@ -54,7 +60,7 @@ def actions_to_wrenches(
     f_n: np.ndarray,
     f_t: np.ndarray,
 ) -> np.ndarray:
-    """Map (p_body, fn, ft) at each pose to world CoM wrench. poses (K,3) or (3,)."""
+    """Map (p_body, fn, ft) at each pose to world CoM wrench."""
     single_pose = poses.ndim == 1
     if single_pose:
         poses = np.broadcast_to(poses, (p_body.shape[0], 3)).copy()
@@ -62,6 +68,16 @@ def actions_to_wrenches(
     f_world = f_n[:, None] * n_world + f_t[:, None] * t_world
     p_world = poses[:, :2] + rotate(poses[:, 2], p_body)
     return contact_force_to_com_wrench(poses, p_world, f_world)
+
+
+def pack_actions(p_mean: np.ndarray, f_n: np.ndarray, f_t: np.ndarray) -> np.ndarray:
+    """Stack body contact + forces into (H, 4) action trajectory."""
+    return np.concatenate([p_mean, f_n[:, None], f_t[:, None]], axis=1)
+
+
+def unpack_actions(actions: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split (..., 4) -> p (..., 2), f_n (...,), f_t (...,)."""
+    return actions[..., :2], actions[..., 2], actions[..., 3]
 
 
 class ObjectSubproblem:
@@ -83,52 +99,70 @@ class ObjectSubproblem:
         self.horizon = int(cfg["horizon"])
         self.mu_c = float(cfg["mu_c"])
         self.f_max = float(cfg["f_max"])
+        self.mppi = MPPIOptimizer(
+            n_samples=int(cfg["k_object"]),
+            temperature=float(cfg["nu_o"]),
+            sampler=GaussianSampler(rng),
+        )
 
-    def solve(
-        self,
-        pose0: np.ndarray,
-        p_mean: np.ndarray,
-        f_n_nom: np.ndarray,
-        f_t_nom: np.ndarray,
-        z: np.ndarray,
-        gamma_o: np.ndarray,
-        sigma_scale: float = 1.0,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Returns f_n_nom, f_t_nom, p_mean, w_obj (H,3), ref_poses (H,3)."""
-        k = int(self.cfg["k_object"])
-        h = self.horizon
-        sigma_p = float(self.cfg["sigma_p"]) * sigma_scale
-        sigma_fn = float(self.cfg["sigma_fn"]) * sigma_scale
-        sigma_ft = float(self.cfg["sigma_ft"]) * sigma_scale
-        dt = float(self.cfg["dt"])
-
+    def _sample_actions(
+        self, nominal: np.ndarray, n_samples: int, sigma_scale: float
+    ) -> np.ndarray:
+        """Custom sampler: rejection on p_c, Gaussian on forces, friction-cone clip."""
+        p_mean, f_n_nom, f_t_nom = unpack_actions(nominal)
         p_k = sample_contact_points(
             self.object_.shape,
             p_mean,
-            sigma_p,
+            float(self.cfg["sigma_p"]) * sigma_scale,
             float(self.cfg["tau_n"]),
             self.rng,
-            k,
+            n_samples,
             int(self.cfg["max_rejection_tries"]),
         )
-        eps_fn = self.rng.standard_normal((k, h)) * sigma_fn
-        eps_ft = self.rng.standard_normal((k, h)) * sigma_ft
+        eps_fn = self.rng.standard_normal((n_samples, self.horizon)) * (
+            float(self.cfg["sigma_fn"]) * sigma_scale
+        )
+        eps_ft = self.rng.standard_normal((n_samples, self.horizon)) * (
+            float(self.cfg["sigma_ft"]) * sigma_scale
+        )
         f_n_k = np.clip(f_n_nom[None] + eps_fn, 0.0, self.f_max)
-        f_t_k = f_t_nom[None] + eps_ft
-        # Friction cone |ft| <= mu_c * fn
-        f_t_k = np.clip(f_t_k, -self.mu_c * f_n_k, self.mu_c * f_n_k)
+        f_t_k = np.clip(
+            f_t_nom[None] + eps_ft, -self.mu_c * f_n_k, self.mu_c * f_n_k
+        )
+        return np.concatenate([p_k, f_n_k[..., None], f_t_k[..., None]], axis=-1)
 
+    def _project_actions(self, nominal: np.ndarray) -> np.ndarray:
+        p, f_n, f_t = unpack_actions(nominal)
+        p = self.object_.shape.project_to_boundary(p)
+        f_n = np.clip(f_n, 0.0, self.f_max)
+        f_t = np.clip(f_t, -self.mu_c * f_n, self.mu_c * f_n)
+        return pack_actions(p, f_n, f_t)
+
+    def _rollout(self, pose0: np.ndarray, actions: np.ndarray) -> dict[str, np.ndarray]:
+        """actions: (K, H, 4) -> poses (K,H,3), wrenches (K,H,3)."""
+        k, h, _ = actions.shape
+        dt = float(self.cfg["dt"])
+        p, f_n, f_t = unpack_actions(actions)
         poses = np.tile(pose0, (k, 1))
         traj = np.zeros((k, h, 3))
         wrenches = np.zeros((k, h, 3))
         for t in range(h):
-            w = actions_to_wrenches(
-                self.object_, poses, p_k[:, t], f_n_k[:, t], f_t_k[:, t]
-            )
+            w = actions_to_wrenches(self.object_, poses, p[:, t], f_n[:, t], f_t[:, t])
             wrenches[:, t] = w
             poses = self.object_.propagate(poses, w, dt)
             traj[:, t] = poses
+        return {"poses": traj, "wrenches": wrenches}
 
+    def _cost(
+        self,
+        actions: np.ndarray,
+        info: dict[str, np.ndarray],
+        z: np.ndarray,
+        gamma_o: np.ndarray,
+    ) -> np.ndarray:
+        traj = info["poses"]
+        wrenches = info["wrenches"]
+        k = traj.shape[0]
         running = goal_cost(
             traj[:, :-1].reshape(-1, 3),
             self.goal,
@@ -150,31 +184,51 @@ class ObjectSubproblem:
         )
         effort = float(self.cfg["r_o"]) * np.sum(wrenches**2, axis=(1, 2))
         admm = self.consensus.penalty_cost_batch(wrenches, z, gamma_o)
-        costs = running + terminal + effort + admm
-        weights = softmax(-costs / float(self.cfg["nu_o"]))
+        return running + terminal + effort + admm
 
-        f_n_nom = np.clip(f_n_nom + np.einsum("k,kt->t", weights, eps_fn), 0.0, self.f_max)
-        f_t_nom = f_t_nom + np.einsum("k,kt->t", weights, eps_ft)
-        f_t_nom = np.clip(f_t_nom, -self.mu_c * f_n_nom, self.mu_c * f_n_nom)
-        p_mean = self.object_.shape.project_to_boundary(
-            np.einsum("k,kti->ti", weights, p_k)
-        )
-
-        # Nominal wrench + reference rollout
+    def _nominal_rollout(
+        self, pose0: np.ndarray, actions: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Deterministic rollout of a single (H,4) action seq -> w_obj, ref_poses."""
+        h = self.horizon
+        dt = float(self.cfg["dt"])
+        p, f_n, f_t = unpack_actions(actions)
         pose = pose0.copy()
         w_obj = np.zeros((h, 3))
         ref_poses = np.zeros((h, 3))
         for t in range(h):
             w = actions_to_wrenches(
-                self.object_,
-                pose,
-                p_mean[t][None],
-                f_n_nom[t : t + 1],
-                f_t_nom[t : t + 1],
+                self.object_, pose, p[t][None], f_n[t : t + 1], f_t[t : t + 1]
             )[0]
             w_obj[t] = w
             pose = self.object_.propagate(pose, w, dt)
             ref_poses[t] = pose
+        return w_obj, ref_poses
+
+    def solve(
+        self,
+        pose0: np.ndarray,
+        p_mean: np.ndarray,
+        f_n_nom: np.ndarray,
+        f_t_nom: np.ndarray,
+        z: np.ndarray,
+        gamma_o: np.ndarray,
+        sigma_scale: float = 1.0,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Returns f_n_nom, f_t_nom, p_mean, w_obj (H,3), ref_poses (H,3)."""
+        nominal = pack_actions(p_mean, f_n_nom, f_t_nom)
+
+        new_nominal, _, _ = self.mppi.solve(
+            nominal,
+            rollout_fn=lambda actions: self._rollout(pose0, actions),
+            cost_fn=lambda actions, info: self._cost(actions, info, z, gamma_o),
+            sample_fn=self._sample_actions,
+            project_fn=self._project_actions,
+            sigma_scale=sigma_scale,
+        )
+
+        p_mean, f_n_nom, f_t_nom = unpack_actions(new_nominal)
+        w_obj, ref_poses = self._nominal_rollout(pose0, new_nominal)
         return f_n_nom, f_t_nom, p_mean, w_obj, ref_poses
 
 

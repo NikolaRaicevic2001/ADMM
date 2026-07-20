@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
 
 import numpy as np
 
 from admm.admm_solver import ADMMSolver
-from dynamics.object_2d import QuasiStaticObject2D
-from geometry.analytical_2d import BoxSDF, CircleSDF, PolygonSDF, t_shape_vertices
 from utils.config import load_config
+from utils.environments import DEFAULT_ENV, build_scenario, list_environments
 from utils.visualization import plot_overview, plot_residuals, save_animation
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
@@ -26,60 +26,80 @@ def unique_path(path: Path) -> Path:
         n += 1
 
 
-def build_scenario(cfg: dict):
-    shape = PolygonSDF(t_shape_vertices())
-    object_ = QuasiStaticObject2D(
-        shape,
-        pose=np.array([0.0, 0.0, 0.0]),
-        mu=float(cfg["mu"]),
-        mass=float(cfg["object_mass"]),
-        gravity=float(cfg["gravity"]),
-        limit_surface_c=float(cfg["limit_surface_c"]),
-        limit_surface_r=float(cfg["limit_surface_r"]),
-        obstacles=[],  # filled below
-        obstacle_margin=float(cfg["obstacle_margin"]),
-        pushout_iters=int(cfg["object_pushout_iters"]),
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="ADMM-MPC planar pushing with world-frame CoM wrench consensus",
     )
-    robot_pos = np.array([-0.05, -0.06])
-    goal = np.array([0.45, 0.5, np.pi / 4])
-    obstacles = [
-        CircleSDF(center_xy=np.array([0.06, 0.30]), radius=0.04),
-        BoxSDF(
-            center_xy=np.array([0.36, 0.16]),
-            half_extents=np.array([0.04, 0.035]),
-            angle=0.2,
-        ),
-        PolygonSDF(np.array([[0.08, 0.40], [0.18, 0.40], [0.13, 0.49]])),
-    ]
-    object_.obstacles = obstacles
-    return shape, object_, robot_pos, goal, obstacles
+    parser.add_argument(
+        "--env",
+        choices=list_environments(),
+        default=DEFAULT_ENV,
+        help=f"Push environment (default: {DEFAULT_ENV}). "
+        f"Available: {', '.join(list_environments())}",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Path to YAML config (default: config/base_config.yaml)",
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Override max control steps from config",
+    )
+    parser.add_argument(
+        "--list-envs",
+        action="store_true",
+        help="Print available environments and exit",
+    )
+    return parser.parse_args(argv)
 
 
-def run(cfg_path: Path | None = None, max_steps: int | None = None):
+def run(
+    cfg_path: Path | None = None,
+    max_steps: int | None = None,
+    env_name: str = DEFAULT_ENV,
+):
     cfg = load_config(cfg_path)
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(int(cfg["random_seed"]))
-    shape, object_, robot_pos, goal, obstacles = build_scenario(cfg)
+    scenario = build_scenario(cfg, env_name)
 
-    solver = ADMMSolver(object_, robot_pos, obstacles, goal, cfg, rng)
+    print(f"env={scenario.name}: {scenario.description}")
+
+    solver = ADMMSolver(
+        scenario.object_,
+        scenario.robot_pos,
+        scenario.obstacles,
+        scenario.goal,
+        cfg,
+        rng,
+    )
     log = solver.run(max_steps=max_steps)
 
     print(f"final object pose: {log['object_pose'][-1]}")
-    print(f"goal pose:          {goal}")
+    print(f"goal pose:          {scenario.goal}")
     print(f"goal reached:       {log['reached']}")
 
-    overview_path = unique_path(RESULTS_DIR / "trajectory_overview.png")
-    plot_overview(log, shape, obstacles, goal, overview_path)
+    tag = scenario.name
+    overview_path = unique_path(RESULTS_DIR / f"trajectory_overview_{tag}.png")
+    plot_overview(
+        log, scenario.shape, scenario.obstacles, scenario.goal, overview_path
+    )
     print(f"saved {overview_path}")
 
-    residual_path = unique_path(RESULTS_DIR / "admm_residuals.png")
+    residual_path = unique_path(RESULTS_DIR / f"admm_residuals_{tag}.png")
     plot_residuals(log, residual_path, eps=float(cfg["eps_r"]))
     print(f"saved {residual_path}")
 
     if cfg.get("save_animation", True):
         try:
-            anim_path = unique_path(RESULTS_DIR / "pushing_animation.gif")
-            save_animation(log, shape, obstacles, goal, anim_path)
+            anim_path = unique_path(RESULTS_DIR / f"pushing_animation_{tag}.gif")
+            save_animation(
+                log, scenario.shape, scenario.obstacles, scenario.goal, anim_path
+            )
             print(f"saved {anim_path}")
         except Exception as exc:
             print(f"skipped animation: {exc}")
@@ -87,5 +107,15 @@ def run(cfg_path: Path | None = None, max_steps: int | None = None):
     return log
 
 
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
+    if args.list_envs:
+        for name in list_environments():
+            scenario = build_scenario(load_config(args.config), name)
+            print(f"  {name:12s}  {scenario.description}")
+        return
+    run(cfg_path=args.config, max_steps=args.max_steps, env_name=args.env)
+
+
 if __name__ == "__main__":
-    run()
+    main()

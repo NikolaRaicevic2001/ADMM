@@ -10,8 +10,8 @@ src/
   geometry/               # Analytical 2D SDFs (circle, box, polygon, capsule)
   dynamics/               # QuasiStaticObject2D, KinematicRobot2D
   contact/                # Jc^T CoM wrench map + SimulateContactStep
-  mppi/                   # Generic GaussianSampler + MPPIOptimizer
-  admm/                   # WrenchConsensus + ADMMSolver
+  mppi/                   # Shared MPPIOptimizer (sample→rollout→weight→aggregate)
+  admm/                   # WrenchConsensus + object/robot adapters + ADMMSolver
   utils/                  # Config, math helpers, matplotlib viz
 tests/
 main_mpc.py               # Receding-horizon entry point
@@ -29,11 +29,20 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-PYTHONPATH=src python main_mpc.py
+PYTHONPATH=src python main_mpc.py                 # default: clutter
+PYTHONPATH=src python main_mpc.py --env corridor
+PYTHONPATH=src python main_mpc.py --env gate
+PYTHONPATH=src python main_mpc.py --list-envs
+PYTHONPATH=src python main_mpc.py --env clutter --max-steps 100
 ```
 
-Outputs under `results/`: `trajectory_overview.png`, `admm_residuals.png`, `pushing_animation.gif`.
+| Env | Description |
+|-----|-------------|
+| `clutter` | Separated circle / box / triangle; goal clear of clutter |
+| `corridor` | Narrow horizontal channel; goal past the exit (no blocking post) |
+| `gate` | Wide vertical gate slot; lightly rotated goal beyond the gate |
 
+Outputs under `results/` are tagged by env, e.g. `trajectory_overview_corridor.png`.
 ## Tests
 
 ```bash
