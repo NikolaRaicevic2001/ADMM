@@ -1,3 +1,5 @@
+# Environment-specific config: gate
+# Confirmed: goal reached (steps 273 / 277 / 345 across repeated runs, seed 0)
 # Modular ADMM-MPC — world-frame CoM wrench consensus (dim=3, frame=world_com)
 random_seed: 0
 save_animation: true
@@ -63,7 +65,7 @@ tau_p_est: 0.35
 # Goal / annealing
 goal_pos_tol: 0.06
 goal_theta_tol: 0.10
-sigma_anneal_band: 4.5
+sigma_anneal_band: 3.375
 min_sigma_scale: 0.2
 
 consensus:

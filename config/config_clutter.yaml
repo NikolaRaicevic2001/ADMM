@@ -1,3 +1,5 @@
+# Environment-specific config: clutter
+# Confirmed: goal reached (e.g. step 486, seed 0, max_control_steps=500)
 # Modular ADMM-MPC — world-frame CoM wrench consensus (dim=3, frame=world_com)
 random_seed: 0
 save_animation: true

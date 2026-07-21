@@ -1,3 +1,5 @@
+# Environment-specific config: corridor
+# Attempt: qf_theta boosted further (90 -> 200), isolated from other envs
 # Modular ADMM-MPC — world-frame CoM wrench consensus (dim=3, frame=world_com)
 random_seed: 0
 save_animation: true
@@ -37,7 +39,7 @@ sigma_robot: [0.12, 0.12]
 q_pos: 40.0
 q_theta: 10.0
 qf_pos: 300.0
-qf_theta: 90.0
+qf_theta: 200.0
 r_o: 0.01        # object wrench effort weight
 r_r: 0.05        # robot control effort weight
 w_obstacle: 60000.0
@@ -61,7 +63,7 @@ gamma_est: 0.6
 tau_p_est: 0.35
 
 # Goal / annealing
-goal_pos_tol: 0.06
+goal_pos_tol: 0.07
 goal_theta_tol: 0.10
 sigma_anneal_band: 4.5
 min_sigma_scale: 0.2

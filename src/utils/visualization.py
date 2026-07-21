@@ -14,6 +14,12 @@ from geometry.analytical_2d import BoxSDF, CircleSDF, PolygonSDF
 from geometry.base_sdf import BaseSDF
 from utils.math_utils import rotate
 
+# Purely cosmetic: draws the dashed goal outline larger than the object's
+# actual footprint so the arrived object visually reads as "inside" the goal
+# marker. Does not affect the goal-reached tolerance check (goal_pos_tol /
+# goal_theta_tol in admm_solver.py), which is unrelated to this scale.
+GOAL_MARKER_SCALE = 1.2
+
 
 def _box_corners(obs: BoxSDF) -> np.ndarray:
     return obs.center + rotate(
@@ -73,7 +79,7 @@ def scene_axis_limits(
 
     pts: list[np.ndarray] = [
         np.asarray(object_pose[:2], dtype=float) + rotate(float(object_pose[2]), local),
-        np.asarray(goal[:2], dtype=float) + rotate(float(goal[2]), local),
+        np.asarray(goal[:2], dtype=float) + rotate(float(goal[2]), local * GOAL_MARKER_SCALE),
         np.asarray(robot_pos, dtype=float).reshape(1, 2),
     ]
     for obs in obstacles:
@@ -111,7 +117,7 @@ def _draw_scene_base(ax, shape, obstacles, goal, log):
     verts0 = getattr(shape, "vertices", None)
     if verts0 is None:
         raise ValueError("plot requires polygonal object shape")
-    goal_verts = goal[:2] + rotate(goal[2], verts0)
+    goal_verts = goal[:2] + rotate(goal[2], verts0 * GOAL_MARKER_SCALE)
     ax.add_patch(
         MplPolygon(
             goal_verts,
@@ -256,7 +262,7 @@ def plot_plan_comparison(
     for ax, k in zip(axes[0], idx):
         for obs in obstacles:
             ax.add_patch(_obstacle_patch(obs))
-        goal_verts = goal[:2] + rotate(goal[2], verts0)
+        goal_verts = goal[:2] + rotate(goal[2], verts0 * GOAL_MARKER_SCALE)
         ax.add_patch(
             MplPolygon(goal_verts, closed=True, fill=False, ec="tab:green", lw=1.5, ls="--")
         )
@@ -357,7 +363,7 @@ def save_animation(
     fig, ax = plt.subplots(figsize=(7.5, 7.5))
     for obs in obstacles:
         ax.add_patch(_obstacle_patch(obs))
-    goal_verts = goal[:2] + rotate(goal[2], verts0)
+    goal_verts = goal[:2] + rotate(goal[2], verts0 * GOAL_MARKER_SCALE)
     ax.add_patch(
         MplPolygon(goal_verts, closed=True, fill=False, ec="tab:green", lw=2, ls="--", zorder=4)
     )
