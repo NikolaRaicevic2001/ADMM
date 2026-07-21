@@ -18,7 +18,7 @@ from utils.math_utils import rotate
 # actual footprint so the arrived object visually reads as "inside" the goal
 # marker. Does not affect the goal-reached tolerance check (goal_pos_tol /
 # goal_theta_tol in admm_solver.py), which is unrelated to this scale.
-GOAL_MARKER_SCALE = 1.35
+GOAL_MARKER_SCALE = 1.2
 
 
 def _box_corners(obs: BoxSDF) -> np.ndarray:
