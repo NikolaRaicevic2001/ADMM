@@ -10,7 +10,12 @@ import numpy as np
 from admm.admm_solver import ADMMSolver
 from utils.config import load_config
 from utils.environments import DEFAULT_ENV, build_scenario, list_environments
-from utils.visualization import plot_overview, plot_residuals, save_animation
+from utils.visualization import (
+    plot_overview,
+    plot_plan_comparison,
+    plot_residuals,
+    save_animation,
+)
 
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
@@ -84,11 +89,28 @@ def run(
     print(f"goal reached:       {log['reached']}")
 
     tag = scenario.name
+    view_pad = float(cfg.get("view_pad_frac", 0.28))
     overview_path = unique_path(RESULTS_DIR / f"trajectory_overview_{tag}.png")
     plot_overview(
-        log, scenario.shape, scenario.obstacles, scenario.goal, overview_path
+        log,
+        scenario.shape,
+        scenario.obstacles,
+        scenario.goal,
+        overview_path,
+        view_pad_frac=view_pad,
     )
     print(f"saved {overview_path}")
+
+    plan_path = unique_path(RESULTS_DIR / f"plan_comparison_{tag}.png")
+    plot_plan_comparison(
+        log,
+        scenario.shape,
+        scenario.obstacles,
+        scenario.goal,
+        plan_path,
+        view_pad_frac=view_pad,
+    )
+    print(f"saved {plan_path}")
 
     residual_path = unique_path(RESULTS_DIR / f"admm_residuals_{tag}.png")
     plot_residuals(log, residual_path, eps=float(cfg["eps_r"]))
@@ -98,7 +120,13 @@ def run(
         try:
             anim_path = unique_path(RESULTS_DIR / f"pushing_animation_{tag}.gif")
             save_animation(
-                log, scenario.shape, scenario.obstacles, scenario.goal, anim_path
+                log,
+                scenario.shape,
+                scenario.obstacles,
+                scenario.goal,
+                anim_path,
+                wrench_arrow_scale=float(cfg.get("wrench_arrow_scale", 0.04)),
+                view_pad_frac=view_pad,
             )
             print(f"saved {anim_path}")
         except Exception as exc:

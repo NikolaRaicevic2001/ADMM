@@ -67,13 +67,12 @@ class ADMMSolver:
             )
         )
 
-    def control_step(self) -> tuple[np.ndarray, list[tuple[float, float]]]:
+    def control_step(self) -> tuple[np.ndarray, list[tuple[float, float]], dict]:
         pose0 = self.object_.pose.copy()
         self.f_n_nom = shift_horizon_zero_tail(self.f_n_nom)
         self.f_t_nom = shift_horizon_zero_tail(self.f_t_nom)
         self.u_nom = shift_horizon_zero_tail(self.u_nom)
         self.p_mean = shift_horizon_zero_tail(self.p_mean)
-        # For p_mean last slot, re-seed from previous last projected point later
         self.z = shift_horizon_zero_tail(self.z)
         self.gamma_o = shift_horizon_zero_tail(self.gamma_o)
         self.gamma_r = shift_horizon_zero_tail(self.gamma_r)
@@ -84,7 +83,6 @@ class ADMMSolver:
         )
         self.p_mean = np.tile(p0, (int(self.cfg["horizon"]), 1))
 
-        # Seek toward contact if not touching
         p_world = pose0[:2] + rotate(pose0[2], p0)
         gap = p_world - self.robot_pos
         gap_norm = np.linalg.norm(gap)
@@ -97,8 +95,23 @@ class ADMMSolver:
             self.u_nom = np.tile((gap / gap_norm) * speed, (int(self.cfg["horizon"]), 1))
 
         residuals: list[tuple[float, float]] = []
+        ref_poses = np.tile(pose0, (int(self.cfg["horizon"]), 1))
+        w_obj = np.zeros((int(self.cfg["horizon"]), 3))
+        w_rob = np.zeros((int(self.cfg["horizon"]), 3))
+        robot_path = np.tile(self.robot_pos, (int(self.cfg["horizon"]), 1))
+        obj_diag: dict[str, Any] = {}
+        rob_diag: dict[str, Any] = {}
+        n_admm_ran = 0
+
         for _ in range(int(self.cfg["n_admm"])):
-            self.f_n_nom, self.f_t_nom, self.p_mean, w_obj, ref_poses = self.object_sp.solve(
+            (
+                self.f_n_nom,
+                self.f_t_nom,
+                self.p_mean,
+                w_obj,
+                ref_poses,
+                obj_diag,
+            ) = self.object_sp.solve(
                 pose0,
                 self.p_mean,
                 self.f_n_nom,
@@ -107,7 +120,7 @@ class ADMMSolver:
                 self.gamma_o,
                 sigma_scale,
             )
-            self.u_nom, w_rob = self.robot_sp.solve(
+            self.u_nom, w_rob, robot_path, rob_diag = self.robot_sp.solve(
                 self.robot_pos,
                 pose0,
                 ref_poses,
@@ -127,13 +140,65 @@ class ADMMSolver:
                 (float(np.linalg.norm(primal)), float(np.linalg.norm(dual)))
             )
             self.z, self.gamma_o, self.gamma_r = z_new, gamma_o_new, gamma_r_new
+            n_admm_ran += 1
             if (
                 residuals[-1][0] <= float(self.cfg["eps_r"])
                 and residuals[-1][1] <= float(self.cfg["eps_s"])
             ):
                 break
 
-        return self.u_nom[0].copy(), residuals
+        robot_object_plan = self._roll_object_under_wrench(pose0, w_rob)
+        plan = {
+            "object_plan": np.vstack([pose0[None, :], ref_poses]),
+            "robot_object_plan": np.vstack([pose0[None, :], robot_object_plan]),
+            "robot_plan_path": np.vstack([self.robot_pos[None, :], robot_path]),
+            "w_obj": w_obj.copy(),
+            "w_rob": w_rob.copy(),
+        }
+
+        # Subsample robot fan for logging/drawing
+        fan = rob_diag.get("robot_rollouts")
+        max_fan = int(self.cfg.get("telemetry_max_robot_rollouts", 24))
+        if fan is not None and fan.shape[0] > max_fan:
+            idx = np.linspace(0, fan.shape[0] - 1, max_fan).astype(int)
+            fan = fan[idx]
+
+        telemetry = {
+            "admm_iters": n_admm_ran,
+            "primal_residual": float(np.linalg.norm(w_obj[0] - w_rob[0])),
+            "primal_residual_full": float(np.linalg.norm(w_obj - w_rob)),
+            "dual_norm_obj": float(np.linalg.norm(self.gamma_o)),
+            "dual_norm_rob": float(np.linalg.norm(self.gamma_r)),
+            "dual_saturated": bool(
+                np.any(np.abs(self.gamma_o) >= float(self.cfg["max_dual"]) - 1e-9)
+                or np.any(np.abs(self.gamma_r) >= float(self.cfg["max_dual"]) - 1e-9)
+            ),
+            "obj_task_cost": float(obj_diag.get("obj_task_cost", 0.0)),
+            "obj_admm_penalty": float(obj_diag.get("obj_admm_penalty", 0.0)),
+            "rob_effort_cost": float(rob_diag.get("rob_effort_cost", 0.0)),
+            "rob_admm_penalty": float(rob_diag.get("rob_admm_penalty", 0.0)),
+            "contact_samples_pc": obj_diag.get(
+                "contact_samples_pc", np.zeros((0, 2))
+            ),
+            "target_pc": obj_diag.get("target_pc", pose0[:2].copy()),
+            "w_obj_world": w_obj[0].copy(),
+            "w_rob_world": w_rob[0].copy(),
+            "robot_rollouts": fan if fan is not None else np.zeros((0, 1, 2)),
+            "object_com": pose0[:2].copy(),
+        }
+        plan["telemetry"] = telemetry
+        return self.u_nom[0].copy(), residuals, plan
+
+    def _roll_object_under_wrench(
+        self, pose0: np.ndarray, wrenches: np.ndarray
+    ) -> np.ndarray:
+        dt = float(self.cfg["dt"])
+        pose = pose0.copy()
+        out = np.zeros_like(wrenches)
+        for t in range(len(wrenches)):
+            pose = self.object_.propagate(pose, wrenches[t], dt)
+            out[t] = pose
+        return out
 
     def run(
         self, max_steps: int | None = None, verbose: bool = True
@@ -143,6 +208,12 @@ class ADMMSolver:
             "object_pose": [self.object_.pose.copy()],
             "robot_pos": [self.robot_pos.copy()],
             "residuals": [],
+            "object_plan": [],
+            "robot_object_plan": [],
+            "robot_plan_path": [],
+            "w_obj": [],
+            "w_rob": [],
+            "telemetry": [],
         }
         reached = False
         dt = float(self.cfg["dt"])
@@ -159,7 +230,10 @@ class ADMMSolver:
         )
 
         for step in range(max_steps):
-            u0, residuals = self.control_step()
+            u0, residuals, plan = self.control_step()
+            telem = plan["telemetry"]
+            telem["step"] = step
+
             new_pose, new_robot, _ = simulate_contact_step(
                 self.object_,
                 self.object_.pose[None],
@@ -174,13 +248,25 @@ class ADMMSolver:
             log["object_pose"].append(self.object_.pose.copy())
             log["robot_pos"].append(self.robot_pos.copy())
             log["residuals"].extend(residuals)
+            log["telemetry"].append(telem)
+            for key in (
+                "object_plan",
+                "robot_object_plan",
+                "robot_plan_path",
+                "w_obj",
+                "w_rob",
+            ):
+                log[key].append(plan[key])
 
             pos_err = np.linalg.norm(self.object_.pose[:2] - self.goal[:2])
             theta_err = abs(wrap_angle(self.object_.pose[2] - self.goal[2]))
             if verbose and step % 20 == 0:
                 print(
                     f"step {step:4d}  pos_err={pos_err:.3f}  "
-                    f"theta_err={theta_err:.3f}  admm_iters={len(residuals)}"
+                    f"theta_err={theta_err:.3f}  admm={telem['admm_iters']}  "
+                    f"prim={telem['primal_residual']:.3f}  "
+                    f"Jtask={telem['obj_task_cost']:.2f}  "
+                    f"RobPen={telem['rob_admm_penalty']:.2f}"
                 )
             if (
                 pos_err < float(self.cfg["goal_pos_tol"])
@@ -194,4 +280,6 @@ class ADMMSolver:
         log["reached"] = reached
         log["object_pose"] = np.array(log["object_pose"])
         log["robot_pos"] = np.array(log["robot_pos"])
+        for key in ("object_plan", "robot_object_plan", "robot_plan_path", "w_obj", "w_rob"):
+            log[key] = np.array(log[key]) if log[key] else np.zeros((0,))
         return log

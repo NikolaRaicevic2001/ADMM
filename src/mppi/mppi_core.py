@@ -103,7 +103,7 @@ class MPPIOptimizer:
 
         Returns
         -------
-        new_nominal, weights, rollout_info
+        new_nominal, weights, rollout_info, samples
         """
         if sample_fn is None:
             samples = self._default_sample(nominal, self.n_samples, sigma_scale)
@@ -126,4 +126,4 @@ class MPPIOptimizer:
         if project_fn is not None:
             new_nominal = project_fn(new_nominal)
 
-        return new_nominal, weights, rollout_info
+        return new_nominal, weights, rollout_info, samples

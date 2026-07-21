@@ -28,7 +28,7 @@ def test_mppi_reduces_quadratic_cost() -> None:
     c0 = float(np.sum((nominal - target) ** 2))
     nom = nominal.copy()
     for _ in range(30):
-        nom, _, _ = opt.solve(nom, rollout_fn, cost_fn)
+        nom, _, _, _ = opt.solve(nom, rollout_fn, cost_fn)
     c1 = float(np.sum((nom - target) ** 2))
     assert c1 < c0 * 0.5
 
@@ -50,11 +50,12 @@ def test_custom_sample_fn_used() -> None:
         return np.sum(actions**2, axis=(1, 2))
 
     opt = MPPIOptimizer(n_samples=16, temperature=1.0, sampler=GaussianSampler(rng))
-    new_nom, weights, _ = opt.solve(
+    new_nom, weights, _, samples = opt.solve(
         nominal, rollout_fn, cost_fn, sample_fn=sample_fn, sigma_scale=1.0
     )
     assert called["sample"]
     assert new_nom.shape == nominal.shape
+    assert samples.shape[0] == 16
     assert np.isclose(weights.sum(), 1.0)
 
 

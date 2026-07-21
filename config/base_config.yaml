@@ -69,3 +69,9 @@ min_sigma_scale: 0.2
 consensus:
   dim: 3
   frame: world_com
+
+# Diagnostic GIF / logging
+telemetry_max_robot_rollouts: 24
+wrench_arrow_scale: 0.04
+# Static scene view: expand env AABB by this fraction (same axes every run)
+view_pad_frac: 0.28

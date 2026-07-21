@@ -205,6 +205,49 @@ class ObjectSubproblem:
             ref_poses[t] = pose
         return w_obj, ref_poses
 
+    def _cost_components(
+        self,
+        pose0: np.ndarray,
+        actions: np.ndarray,
+        z: np.ndarray,
+        gamma_o: np.ndarray,
+    ) -> dict[str, float]:
+        """Nominal (single) action cost breakdown for telemetry."""
+        info = self._rollout(pose0, actions[None])
+        traj = info["poses"][0]
+        wrenches = info["wrenches"][0]
+        task = float(
+            goal_cost(
+                traj[:-1],
+                self.goal,
+                float(self.cfg["q_pos"]),
+                float(self.cfg["q_theta"]),
+            ).sum()
+            + goal_cost(
+                traj[-1:],
+                self.goal,
+                float(self.cfg["qf_pos"]),
+                float(self.cfg["qf_theta"]),
+            )[0]
+        )
+        obs = float(
+            obstacle_cost(
+                self.object_.shape,
+                traj[:-1],
+                self.obstacles,
+                float(self.cfg["obstacle_margin"]),
+                float(self.cfg["w_obstacle"]),
+            ).sum()
+        )
+        effort = float(self.cfg["r_o"]) * float(np.sum(wrenches**2))
+        admm = float(self.consensus.penalty_cost(wrenches, z, gamma_o))
+        return {
+            "obj_task_cost": task,
+            "obj_obstacle_cost": obs,
+            "obj_effort_cost": effort,
+            "obj_admm_penalty": admm,
+        }
+
     def solve(
         self,
         pose0: np.ndarray,
@@ -214,11 +257,11 @@ class ObjectSubproblem:
         z: np.ndarray,
         gamma_o: np.ndarray,
         sigma_scale: float = 1.0,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Returns f_n_nom, f_t_nom, p_mean, w_obj (H,3), ref_poses (H,3)."""
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+        """Returns f_n, f_t, p_mean, w_obj, ref_poses, diagnostics."""
         nominal = pack_actions(p_mean, f_n_nom, f_t_nom)
 
-        new_nominal, _, _ = self.mppi.solve(
+        new_nominal, _, _, samples = self.mppi.solve(
             nominal,
             rollout_fn=lambda actions: self._rollout(pose0, actions),
             cost_fn=lambda actions, info: self._cost(actions, info, z, gamma_o),
@@ -229,7 +272,18 @@ class ObjectSubproblem:
 
         p_mean, f_n_nom, f_t_nom = unpack_actions(new_nominal)
         w_obj, ref_poses = self._nominal_rollout(pose0, new_nominal)
-        return f_n_nom, f_t_nom, p_mean, w_obj, ref_poses
+
+        # Contact samples at t=0 in world frame + selected target
+        p_body_samples = samples[:, 0, :2]
+        contact_samples_world = pose0[:2] + rotate(pose0[2], p_body_samples)
+        target_pc_world = pose0[:2] + rotate(pose0[2], p_mean[0])
+        costs = self._cost_components(pose0, new_nominal, z, gamma_o)
+        diagnostics = {
+            "contact_samples_pc": contact_samples_world,
+            "target_pc": target_pc_world,
+            **costs,
+        }
+        return f_n_nom, f_t_nom, p_mean, w_obj, ref_poses, diagnostics
 
 
 class ContactPointEstimator:

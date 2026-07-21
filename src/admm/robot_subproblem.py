@@ -100,13 +100,15 @@ class RobotSubproblem:
             )
         return cost
 
-    def _nominal_wrenches(
+    def _nominal_rollout(
         self, robot_pos0: np.ndarray, ref_poses: np.ndarray, u_nom: np.ndarray
-    ) -> np.ndarray:
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Re-simulate nominal u: returns w_rob (H,3), robot_path (H,2)."""
         dt = float(self.cfg["dt"])
         params = self._sim_params()
         robot_pos = robot_pos0.copy()
         w_rob = np.zeros((self.horizon, 3))
+        robot_path = np.zeros((self.horizon, 2))
         for t in range(self.horizon):
             _, robot_pos, wrench = simulate_contact_step(
                 self.object_,
@@ -118,7 +120,45 @@ class RobotSubproblem:
                 **params,
             )
             w_rob[t] = np.asarray(wrench).reshape(3)
-        return w_rob
+            robot_path[t] = np.asarray(robot_pos).reshape(2)
+        return w_rob, robot_path
+
+    def _cost_components(
+        self,
+        actions: np.ndarray,
+        info: dict[str, np.ndarray],
+        z: np.ndarray,
+        gamma_r: np.ndarray,
+    ) -> dict[str, float]:
+        """Nominal cost breakdown (actions shape (H,2))."""
+        wrenches = info["wrenches"]
+        positions = info["positions"]
+        if wrenches.ndim == 2:
+            wrenches = wrenches[None]
+            positions = positions[None]
+            actions_b = actions[None]
+        else:
+            actions_b = actions
+        effort = float(self.cfg["r_r"]) * float(np.sum(actions_b[0] ** 2))
+        obs = 0.0
+        admm = 0.0
+        for t in range(actions_b.shape[1]):
+            obs += float(
+                robot_obstacle_cost(
+                    positions[0:1, t],
+                    self.obstacles,
+                    float(self.cfg["obstacle_margin"]),
+                    float(self.cfg["w_obstacle"]),
+                )[0]
+            )
+            admm += 0.5 * self.consensus.rho * float(
+                np.sum((wrenches[0, t] - z[t] + gamma_r[t]) ** 2)
+            )
+        return {
+            "rob_effort_cost": effort,
+            "rob_obstacle_cost": obs,
+            "rob_admm_penalty": admm,
+        }
 
     def solve(
         self,
@@ -129,14 +169,29 @@ class RobotSubproblem:
         z: np.ndarray,
         gamma_r: np.ndarray,
         sigma_scale: float = 1.0,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Returns u_nom (H,2), w_rob (H,3). Uses x^{o,ref} inside contact sim."""
-        del pose0  # kept for API symmetry with the ADMM solver
-        u_nom, _, _ = self.mppi.solve(
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+        """Returns u_nom, w_rob, robot_path, diagnostics."""
+        del pose0
+        u_nom, _, rollout_info, samples = self.mppi.solve(
             u_nom,
             rollout_fn=lambda actions: self._rollout(robot_pos0, ref_poses, actions),
             cost_fn=lambda actions, info: self._cost(actions, info, z, gamma_r),
             sigma_scale=sigma_scale,
         )
-        w_rob = self._nominal_wrenches(robot_pos0, ref_poses, u_nom)
-        return u_nom, w_rob
+        w_rob, robot_path = self._nominal_rollout(robot_pos0, ref_poses, u_nom)
+
+        # Fan: prepend start so paths are (K, H+1, 2)
+        positions = rollout_info["positions"]
+        k = positions.shape[0]
+        start = np.broadcast_to(robot_pos0.reshape(1, 1, 2), (k, 1, 2))
+        fan = np.concatenate([start, positions], axis=1)
+        nom_info = {
+            "wrenches": w_rob,
+            "positions": robot_path,
+        }
+        costs = self._cost_components(u_nom, nom_info, z, gamma_r)
+        diagnostics = {
+            "robot_rollouts": fan,
+            **costs,
+        }
+        return u_nom, w_rob, robot_path, diagnostics
