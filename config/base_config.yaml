@@ -71,7 +71,7 @@ consensus:
   frame: world_com
 
 # Physics backend for robot contact + execution: analytical | mjx
-physics_backend: mjx
+physics_backend: analytical
 robot_radius: 0.012
 robot_mass: 1.0
 robot_max_speed: 0.6
