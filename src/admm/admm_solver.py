@@ -9,8 +9,8 @@ import numpy as np
 from admm.consensus_spaces import WrenchConsensus
 from admm.object_subproblem import ContactPointEstimator, ObjectSubproblem
 from admm.robot_subproblem import RobotSubproblem
-from contact.resolution import simulate_contact_step
 from dynamics.object_2d import QuasiStaticObject2D
+from dynamics.physics_engine import build_engine_pair
 from geometry.base_sdf import BaseSDF
 from utils.math_utils import rotate, shift_horizon_zero_tail, wrap_angle
 
@@ -38,8 +38,16 @@ class ADMMSolver:
         self.object_sp = ObjectSubproblem(
             object_, obstacles, goal, cfg, self.consensus, self.rng
         )
+        engines = build_engine_pair(cfg, object_, obstacles)
+        self.planning_engine = engines.planning
+        self.execution_engine = engines.execution
         self.robot_sp = RobotSubproblem(
-            object_, obstacles, cfg, self.consensus, self.rng
+            object_,
+            obstacles,
+            cfg,
+            self.consensus,
+            self.rng,
+            planning_engine=self.planning_engine,
         )
 
         q0 = object_.body_frame_point(self.robot_pos, object_.pose)
@@ -86,11 +94,19 @@ class ADMMSolver:
         p_world = pose0[:2] + rotate(pose0[2], p0)
         gap = p_world - self.robot_pos
         gap_norm = np.linalg.norm(gap)
-        if gap_norm > float(self.cfg["contact_step_margin"]):
+        seek_gap = max(
+            float(self.cfg["contact_step_margin"]),
+            float(self.cfg.get("robot_radius", 0.012)) * 2.0,
+        )
+        if gap_norm > seek_gap:
+            max_speed = min(
+                float(self.cfg["seek_max_speed"]),
+                float(self.cfg.get("robot_max_speed", self.cfg["seek_max_speed"])),
+            )
             speed = np.clip(
                 gap_norm / float(self.cfg["dt"]),
                 float(self.cfg["seek_min_speed"]),
-                float(self.cfg["seek_max_speed"]),
+                max_speed,
             )
             self.u_nom = np.tile((gap / gap_norm) * speed, (int(self.cfg["horizon"]), 1))
 
@@ -217,31 +233,14 @@ class ADMMSolver:
         }
         reached = False
         dt = float(self.cfg["dt"])
-        params = dict(
-            f_max=float(self.cfg["f_max"]),
-            mu_c=float(self.cfg["mu_c"]),
-            obstacles=self.obstacles,
-            n_substeps=int(self.cfg["n_contact_substeps"]),
-            contact_step_margin=float(self.cfg["contact_step_margin"]),
-            max_contact_step=float(self.cfg["max_contact_step"]),
-            obstacle_margin=float(self.cfg["obstacle_margin"]),
-            pushout_iters=int(self.cfg["object_pushout_iters"]),
-            freeze_object=False,
-        )
 
         for step in range(max_steps):
             u0, residuals, plan = self.control_step()
             telem = plan["telemetry"]
             telem["step"] = step
 
-            new_pose, new_robot, _ = simulate_contact_step(
-                self.object_,
-                self.object_.pose[None],
-                self.robot_pos[None],
-                u0[None],
-                dt,
-                **params,
-            )
+            self.execution_engine.seed(self.object_.pose, self.robot_pos)
+            new_pose, new_robot = self.execution_engine.step_execution(u0, dt)
             self.object_.pose = np.asarray(new_pose).reshape(3)
             self.robot_pos = np.asarray(new_robot).reshape(2)
 

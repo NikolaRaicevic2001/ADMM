@@ -17,6 +17,12 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+mjx = [
+    "mujoco>=3.2.0",
+    "mujoco-mjx>=3.2.0",
+    "jax>=0.4.26",
+    "jaxlib>=0.4.26",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

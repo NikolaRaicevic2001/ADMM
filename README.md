@@ -30,7 +30,7 @@ ADMM/
 ├── tests/                    # Unit + smoke tests (SDF, wrench, consensus, envs, MPPI)
 └── src/
     ├── geometry/             # Analytical 2D signed-distance fields (SDFs)
-    ├── dynamics/             # Quasi-static object + PhysicsEngine2D (Pymunk / analytical)
+    ├── dynamics/             # Quasi-static object + PhysicsEngine2D (analytical / MJX)
     ├── contact/              # Jcᵀ wrench map + analytical contact (legacy backend)
     ├── mppi/                 # Shared sample→rollout→cost→softmax→aggregate core
     ├── admm/                 # Wrench consensus + object/robot subproblems + solver
@@ -42,28 +42,33 @@ ADMM/
 | Path | Role |
 |------|------|
 | `main_mpc.py` | Loads YAML config, builds a named scenario (`clutter` / `corridor` / `gate`), runs `ADMMSolver`, writes overview / plan comparison / residual plots and an optional diagnostic GIF under `results/`. |
-| `config/base_config.yaml` | Hyperparameters including `physics_backend: pymunk \| analytical`. |
+| `config/base_config.yaml` | Hyperparameters including `physics_backend: analytical \| mjx` (default analytical). |
 | `src/geometry/` | Analytical 2D SDFs; T-shape from `t_shape_vertices()`. |
 | `src/dynamics/object_2d.py` | `QuasiStaticObject2D` limit-surface model used by **object MPPI**. |
-| `src/dynamics/physics_engine.py` | `PhysicsEngine2D` ABC + `EnginePair` factory (`save_state` / `restore_state`, `set_kinematic_target`, `step_batch`, `rollout_batch`). |
-| `src/dynamics/pymunk_engine.py` | Dual Pymunk worlds: permanently kinematic **PlanningEngine** + permanently dynamic **ExecutionEngine** (limit-surface joints); CoM forced to local $(0,0)$. |
-| `src/dynamics/analytical_engine.py` | Same ABC wrapping legacy `simulate_contact_step`. |
+| `src/dynamics/physics_engine.py` | `PhysicsEngine2D` ABC + `EnginePair` factory: NumPy-only `seed` / `step_execution` / `rollout_batch`. |
+| `src/dynamics/analytical_engine.py` | SDF contact adapter wrapping `simulate_contact_step`. |
+| `src/dynamics/mjx_scene.py` | MJCF builders for planning (mocap weld) and execution (`frictionloss`) worlds. |
+| `src/dynamics/mjx_engine.py` | MJX backend: JIT `vmap`×`scan` planning rollouts; NumPy boundary for ADMM. |
 | `src/dynamics/robot_2d.py` | Reference kinematic robot model (ADMM path uses the physics engine). |
 | `src/dynamics/obstacles.py` | Hinge obstacle costs and SDF push-out helpers. |
 | `src/contact/wrench_map.py` | $w = J_c^\top f$ world CoM wrench map. |
-| `src/contact/resolution.py` | Analytical contact used only when `physics_backend=analytical`. |
+| `src/contact/resolution.py` | Analytical contact used by the analytical physics backend. |
 | `src/mppi/` | Shared MPPI core + Gaussian sampler. |
 | `src/admm/` | Wrench consensus, object/robot subproblems, `ADMMSolver`. |
 | `src/utils/` | Config, environments, visualization, math helpers. |
-| `tests/` | SDF, wrench, consensus, envs, MPPI, Pymunk engine tests. |
+| `tests/` | SDF, wrench, consensus, envs, MPPI, MJX verification matrix. |
 
-### Physics backends (Phase 1)
+### Physics backends
 
-- **Default:** `physics_backend: pymunk` (set `analytical` to A/B against the legacy SDF contact path).
-- **Object MPPI** stays analytical ($x^+=x+\Delta t\,(D\odot w)$).
-- **Robot MPPI** uses the planning engine (kinematic object + `rollout_batch`); no mid-sim body-type toggles.
-- **Execution** uses the dynamic execution engine with Pivot/Gear tabletop friction.
-- Interface is ready for PyBullet / Drake (dual worlds + save/restore) and Warp (`step_batch` signature).
+- **Default:** `physics_backend: analytical` (fast SDF contact via `simulate_contact_step`).
+- Set `physics_backend: mjx` for MuJoCo MJX batched robot contact + execution (GPU preferred; CPU works).
+- **Object MPPI** always stays analytical ($x^+=x+\Delta t\,(D\odot w)$).
+- **Algorithm ↔ simulator contract** (NumPy only; no JAX types leak upward):
+  - `rollout_batch(u_seq, ref_poses, robot_pos0, dt) → wrenches, paths` for robot MPPI
+  - `seed` + `step_execution(u, dt) → pose, robot` for the MPC plant
+- **Dual engines (mjx):** Planning = dynamic object **welded to mocap** + velocity-actuated planar finger (JIT `vmap`/`scan`). Execution = planar object with joint `frictionloss` (tabletop) + velocity-actuated finger. Soft contacts via `solref`/`solimp` (no CPU SDF inside the XLA kernel).
+- CoM wrench from fixed-size contact sensors (`reduce=maxforce`); force on object = −force on robot.
+- Roadmap: MJX → NVIDIA Warp implementing the same `PhysicsEngine2D` ABC.
 
 ### Control-flow sketch
 
@@ -311,19 +316,23 @@ $$
 ```bash
 python3 -m venv venv
 source venv/bin/activate
-pip install -r requirements.txt   
+pip install -r requirements.txt 
+# Optional GPU: install a CUDA-enabled jaxlib matching your driver
+#   (see https://jax.readthedocs.io/en/latest/installation.html)
 ```
 
 ## Run
 
 ```bash
-PYTHONPATH=src python main_mpc.py                 # default: clutter
+PYTHONPATH=src python main_mpc.py                 # default: clutter (analytical backend)
 PYTHONPATH=src python main_mpc.py --env corridor
 PYTHONPATH=src python main_mpc.py --env gate
 PYTHONPATH=src python main_mpc.py --list-envs
 PYTHONPATH=src python main_mpc.py --env clutter --max-steps 100
 PYTHONPATH=src python main_mpc.py --config /path/to/custom.yaml
 ```
+
+For MJX, set `physics_backend: mjx` in `config/base_config.yaml` (or a custom config). First call JIT-compiles the batched rollout (slow once); subsequent MPC steps reuse the compiled kernel.
 
 Outputs land in `results/` (overview PNG, plan-comparison PNG, residual PNG, optional GIF). Filenames are tagged by environment and get a numeric suffix if a file already exists.
 

@@ -70,6 +70,14 @@ consensus:
   dim: 3
   frame: world_com
 
+# Physics backend for robot contact + execution: analytical | mjx
+physics_backend: mjx
+robot_radius: 0.012
+robot_mass: 1.0
+robot_max_speed: 0.6
+mjx_n_substeps: 4
+mjx_solver_iterations: 20
+
 # Diagnostic GIF / logging
 telemetry_max_robot_rollouts: 24
 wrench_arrow_scale: 0.04
