@@ -60,6 +60,16 @@ class MjxPlanningEngine(PhysicsEngine2D):
         self._robot_qadr = int(self.mj_model.jnt_qposadr[
             mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "robot_x")
         ])
+        # robot_x/robot_y are plain 1-DOF slide joints along world x/y, so their
+        # qfrc_constraint entries are already world-frame force components (no
+        # per-contact frame rotation needed) — see CODE_CHANGES_LOG.md for why
+        # this replaced the old contact-sensor-based wrench computation.
+        self._robot_x_dof = int(self.mj_model.jnt_dofadr[
+            mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "robot_x")
+        ])
+        self._robot_y_dof = int(self.mj_model.jnt_dofadr[
+            mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "robot_y")
+        ])
         self._wrench_clip = self.f_max * (1.0 + self.mu_c)
         self._jitted_rollout = self._compile_rollout()
 
@@ -67,6 +77,8 @@ class MjxPlanningEngine(PhysicsEngine2D):
         model = self.mjx_model
         n_sub = self.n_substeps
         robot_qadr = self._robot_qadr
+        robot_x_dof = self._robot_x_dof
+        robot_y_dof = self._robot_y_dof
         object_body = self._object_body
         robot_body = self._robot_body
         wrench_clip = self._wrench_clip
@@ -114,9 +126,15 @@ class MjxPlanningEngine(PhysicsEngine2D):
 
                 data, _ = jax.lax.scan(substep, data, None, length=n_sub)
 
-                # Contact forces on robot (geom1); force on object is opposite.
-                f_sum = data.sensordata[0:3] + data.sensordata[3:6]
-                f_obj = -f_sum
+                # World-frame contact force on the robot's own (axis-aligned)
+                # slide joints; force on the object is the Newton's-third-law
+                # opposite. (Not using the contact-force sensors here: MuJoCo
+                # reports those in each contact's local [normal, tangent1,
+                # tangent2] frame, not world xyz — see CODE_CHANGES_LOG.md.)
+                f_on_robot = jnp.array(
+                    [data.qfrc_constraint[robot_x_dof], data.qfrc_constraint[robot_y_dof]]
+                )
+                f_obj = -f_on_robot
                 obj_xy = data.xpos[object_body, 0:2]
                 rob_xy = data.xpos[robot_body, 0:2]
                 r = rob_xy - obj_xy

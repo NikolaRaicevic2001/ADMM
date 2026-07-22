@@ -1,0 +1,90 @@
+# Environment-specific config: clutter, MJX backend
+# Same proven hyperparameters as config_clutter.yaml (goal reached at step 486
+# on the analytical backend), with physics_backend explicitly set to mjx so
+# this actually exercises the MuJoCo MJX robot-contact + execution engine
+# instead of silently falling back to analytical.
+# Modular ADMM-MPC — world-frame CoM wrench consensus (dim=3, frame=world_com)
+random_seed: 0
+save_animation: true
+max_control_steps: 800
+
+dt: 0.05
+horizon: 15
+n_admm: 12
+k_object: 64
+k_robot: 64
+
+# Friction / limit surface
+mu: 0.4          # object-support Coulomb friction
+mu_c: 0.5        # robot-object Coulomb friction
+object_mass: 2.0
+gravity: 9.81
+limit_surface_c: 1.0
+limit_surface_r: 0.06
+
+f_max: 4.0
+rho: 1.0
+max_dual: 15.0   # gamma_max anti-windup (box clip per component)
+eps_r: 1.0
+eps_s: 1.0
+
+# MPPI
+nu_o: 1.0        # object temperature
+nu_r: 1.0        # robot temperature
+sigma_fn: 0.7
+sigma_ft: 0.3
+sigma_p: 0.012
+tau_n: 0.7
+max_rejection_tries: 8
+sigma_robot: [0.12, 0.12]
+
+# Costs
+q_pos: 40.0
+q_theta: 10.0
+qf_pos: 500.0
+qf_theta: 150.0
+r_o: 0.01        # object wrench effort weight
+r_r: 0.05        # robot control effort weight
+w_obstacle: 60000.0
+obstacle_margin: 0.015
+
+# Contact numerics (analytical-backend only; ignored by mjx)
+contact_step_margin: 0.003
+max_contact_step: 0.008
+n_contact_substeps: 4
+object_pushout_iters: 4
+seek_min_speed: 0.4
+seek_max_speed: 1.0
+
+# Contact-point estimator
+n_p_est: 48
+r_est: 4
+h_p_est: 5
+sigma_init_est: 0.006
+sigma_min_est: 0.004
+gamma_est: 0.6
+tau_p_est: 0.35
+
+# Goal / annealing
+goal_pos_tol: 0.06
+goal_theta_tol: 0.10
+sigma_anneal_band: 4.5
+min_sigma_scale: 0.2
+
+consensus:
+  dim: 3
+  frame: world_com
+
+# Physics backend for robot contact + execution: analytical | mjx
+physics_backend: mjx
+robot_radius: 0.012
+robot_mass: 1.0
+robot_max_speed: 0.6
+mjx_n_substeps: 4
+mjx_solver_iterations: 20
+
+# Diagnostic GIF / logging
+telemetry_max_robot_rollouts: 24
+wrench_arrow_scale: 0.04
+# Static scene view: expand env AABB by this fraction (same axes every run)
+view_pad_frac: 0.28

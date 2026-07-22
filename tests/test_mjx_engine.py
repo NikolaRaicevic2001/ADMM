@@ -108,6 +108,37 @@ def test_planning_contact_wrench_sign(engines, cfg_mjx):
     assert np.mean(late) < -0.5
 
 
+def test_planning_contact_wrench_sign_mirrors_with_approach_direction(engines, cfg_mjx):
+    """Regression test: pushing from the opposite side must flip the wrench sign.
+
+    Guards against reading a contact sensor's local [normal, tangent1,
+    tangent2] frame as if it were world [fx, fy, fz] — that bug produced the
+    *same* clipped wrench regardless of which side of the object was hit
+    (caught by comparing mirror-image approaches, not by checking a single
+    direction in isolation). See CODE_CHANGES_LOG.md, mjx_engine.py fix.
+    """
+    pair, sc = engines
+    dt = float(cfg_mjx["dt"])
+    ref = np.tile(sc.object_.pose.astype(float), (6, 1))
+
+    # Approach from the right, push left (same as test_planning_contact_wrench_sign).
+    r0_right = sc.object_.pose[:2] + np.array([0.12, 0.03])
+    u_left = np.zeros((1, 6, 2))
+    u_left[0, :, 0] = -0.3
+    w_from_right, _ = pair.planning.rollout_batch(u_left, ref, r0_right, dt)
+
+    # Mirror: approach from the left, push right.
+    r0_left = sc.object_.pose[:2] + np.array([-0.12, 0.03])
+    u_right = np.zeros((1, 6, 2))
+    u_right[0, :, 0] = 0.3
+    w_from_left, _ = pair.planning.rollout_batch(u_right, ref, r0_left, dt)
+
+    fx_from_right = float(np.mean(w_from_right[0, 2:, 0]))
+    fx_from_left = float(np.mean(w_from_left[0, 2:, 0]))
+    assert fx_from_right < -0.5, "pushing left from the right side should give negative fx"
+    assert fx_from_left > 0.5, "pushing right from the left side should give positive fx"
+
+
 def test_rollout_batch_shapes(engines, cfg_mjx):
     pair, sc = engines
     k, h = 3, 4

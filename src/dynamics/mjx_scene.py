@@ -191,8 +191,8 @@ def build_execution_xml(cfg: dict[str, Any], obstacles: list[BaseSDF]) -> str:
       <site name="object_com" pos="0 0 0" size="0.008"/>
     </body>
     <body name="robot" pos="0 0 {z}">
-      <joint name="robot_x" type="slide" axis="1 0 0"/>
-      <joint name="robot_y" type="slide" axis="0 1 0"/>
+      <joint name="robot_x" type="slide" axis="1 0 0" damping="0.05"/>
+      <joint name="robot_y" type="slide" axis="0 1 0" damping="0.05"/>
       <geom name="robot_geom" type="sphere" size="{r:.6g}" mass="{robot_mass:.6g}"
             rgba="0.9 0.25 0.2 1"/>
     </body>
