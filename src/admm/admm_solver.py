@@ -94,15 +94,28 @@ class ADMMSolver:
         p_world = pose0[:2] + rotate(pose0[2], p0)
         gap = p_world - self.robot_pos
         gap_norm = np.linalg.norm(gap)
-        seek_gap = max(
-            float(self.cfg["contact_step_margin"]),
-            float(self.cfg.get("robot_radius", 0.012)) * 2.0,
-        )
-        if gap_norm > seek_gap:
-            max_speed = min(
-                float(self.cfg["seek_max_speed"]),
-                float(self.cfg.get("robot_max_speed", self.cfg["seek_max_speed"])),
+        # robot_radius only describes real collision geometry for the MJX
+        # backend (a sphere) -- the analytical backend's robot is a
+        # dimensionless point (see KinematicRobot2D / resolve_contact), so
+        # folding robot_radius into the seek-gap/speed logic there doesn't
+        # match that backend's own physics and was an unintended side effect
+        # of adding MJX parity. See CODE_CHANGES_LOG.md.
+        is_mjx = str(self.cfg.get("physics_backend", "analytical")).lower() == "mjx"
+        if is_mjx:
+            seek_gap = max(
+                float(self.cfg["contact_step_margin"]),
+                float(self.cfg.get("robot_radius", 0.012)) * 2.0,
             )
+        else:
+            seek_gap = float(self.cfg["contact_step_margin"])
+        if gap_norm > seek_gap:
+            if is_mjx:
+                max_speed = min(
+                    float(self.cfg["seek_max_speed"]),
+                    float(self.cfg.get("robot_max_speed", self.cfg["seek_max_speed"])),
+                )
+            else:
+                max_speed = float(self.cfg["seek_max_speed"])
             speed = np.clip(
                 gap_norm / float(self.cfg["dt"]),
                 float(self.cfg["seek_min_speed"]),

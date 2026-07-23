@@ -34,7 +34,7 @@ sigma_ft: 0.3
 sigma_p: 0.012
 tau_n: 0.7
 max_rejection_tries: 8
-sigma_robot: [0.12, 0.12]
+sigma_robot: [0.18, 0.18]
 
 # Costs
 q_pos: 40.0
