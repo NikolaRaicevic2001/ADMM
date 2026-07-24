@@ -6,7 +6,11 @@ from typing import Any
 
 import numpy as np
 
-from dynamics.mjx_scene import build_execution_xml, build_planning_xml
+from dynamics.mjx_scene import (
+    build_coupled_planning_xml,
+    build_execution_xml,
+    build_planning_xml,
+)
 from dynamics.object_2d import QuasiStaticObject2D
 from dynamics.physics_engine import EnginePair, PhysicsEngine2D
 from geometry.base_sdf import BaseSDF
@@ -33,7 +37,7 @@ def _clip_speed(u: np.ndarray, vmax: float) -> np.ndarray:
 
 
 class MjxPlanningEngine(PhysicsEngine2D):
-    """Planning world: object welded to mocap; robot velocity-actuated."""
+    """Planning world: frozen (mocap weld) or coupled (dynamic planar object)."""
 
     def __init__(
         self,
@@ -44,10 +48,21 @@ class MjxPlanningEngine(PhysicsEngine2D):
         self.vmax = float(cfg.get("robot_max_speed", 1.0))
         self.f_max = float(cfg["f_max"])
         self.mu_c = float(cfg["mu_c"])
-        self.n_substeps = max(int(cfg.get("mjx_n_substeps", cfg.get("n_contact_substeps", 4))), 1)
+        self.n_substeps = max(
+            int(cfg.get("mjx_n_substeps", cfg.get("n_contact_substeps", 4))), 1
+        )
         self.z = 0.05
+        mode = str(cfg.get("robot_rollout_mode", "frozen")).lower().strip()
+        if mode not in ("frozen", "coupled"):
+            raise ValueError(
+                f"Unknown robot_rollout_mode '{mode}'. Choose from: frozen, coupled"
+            )
+        self.rollout_mode = mode
 
-        xml = build_planning_xml(cfg, obstacles)
+        if mode == "frozen":
+            xml = build_planning_xml(cfg, obstacles)
+        else:
+            xml = build_coupled_planning_xml(cfg, obstacles)
         self.mj_model = mujoco.MjModel.from_xml_string(xml)
         self.mjx_model = mjx.put_model(self.mj_model)
         self._object_body = mujoco.mj_name2id(
@@ -56,24 +71,36 @@ class MjxPlanningEngine(PhysicsEngine2D):
         self._robot_body = mujoco.mj_name2id(
             self.mj_model, mujoco.mjtObj.mjOBJ_BODY, "robot"
         )
-        # freejoint qpos: xyz + quat; robot slides at end
-        self._robot_qadr = int(self.mj_model.jnt_qposadr[
-            mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "robot_x")
-        ])
-        # robot_x/robot_y are plain 1-DOF slide joints along world x/y, so their
-        # qfrc_constraint entries are already world-frame force components (no
-        # per-contact frame rotation needed) — see CODE_CHANGES_LOG.md for why
-        # this replaced the old contact-sensor-based wrench computation.
-        self._robot_x_dof = int(self.mj_model.jnt_dofadr[
-            mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "robot_x")
-        ])
-        self._robot_y_dof = int(self.mj_model.jnt_dofadr[
-            mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "robot_y")
-        ])
+        self._robot_qadr = int(
+            self.mj_model.jnt_qposadr[
+                mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "robot_x")
+            ]
+        )
+        self._robot_x_dof = int(
+            self.mj_model.jnt_dofadr[
+                mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "robot_x")
+            ]
+        )
+        self._robot_y_dof = int(
+            self.mj_model.jnt_dofadr[
+                mujoco.mj_name2id(self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "robot_y")
+            ]
+        )
         self._wrench_clip = self.f_max * (1.0 + self.mu_c)
-        self._jitted_rollout = self._compile_rollout()
+        if mode == "coupled":
+            self._object_qadr = int(
+                self.mj_model.jnt_qposadr[
+                    mujoco.mj_name2id(
+                        self.mj_model, mujoco.mjtObj.mjOBJ_JOINT, "object_x"
+                    )
+                ]
+            )
+            self._jitted_rollout = self._compile_coupled_rollout()
+        else:
+            self._object_qadr = 0
+            self._jitted_rollout = self._compile_frozen_rollout()
 
-    def _compile_rollout(self):
+    def _compile_frozen_rollout(self):
         model = self.mjx_model
         n_sub = self.n_substeps
         robot_qadr = self._robot_qadr
@@ -85,12 +112,10 @@ class MjxPlanningEngine(PhysicsEngine2D):
         z = self.z
 
         def single_rollout(u_seq, ref_poses, robot_pos0):
-            # u_seq: (H, 2), ref_poses: (H, 3), robot_pos0: (2,)
             data0 = mjx.make_data(model)
 
             def init_state():
                 qpos = data0.qpos
-                # object freejoint from first ref pose
                 pose0 = ref_poses[0]
                 quat = jnp.array(
                     [jnp.cos(0.5 * pose0[2]), 0.0, 0.0, jnp.sin(0.5 * pose0[2])]
@@ -102,7 +127,9 @@ class MjxPlanningEngine(PhysicsEngine2D):
                     jnp.array([pose0[0], pose0[1], z])
                 )
                 mocap_quat = data0.mocap_quat.at[0].set(quat)
-                return data0.replace(qpos=qpos, mocap_pos=mocap_pos, mocap_quat=mocap_quat)
+                return data0.replace(
+                    qpos=qpos, mocap_pos=mocap_pos, mocap_quat=mocap_quat
+                )
 
             data = init_state()
 
@@ -126,30 +153,77 @@ class MjxPlanningEngine(PhysicsEngine2D):
 
                 data, _ = jax.lax.scan(substep, data, None, length=n_sub)
 
-                # World-frame contact force on the robot's own (axis-aligned)
-                # slide joints; force on the object is the Newton's-third-law
-                # opposite. (Not using the contact-force sensors here: MuJoCo
-                # reports those in each contact's local [normal, tangent1,
-                # tangent2] frame, not world xyz — see CODE_CHANGES_LOG.md.)
                 f_on_robot = jnp.array(
-                    [data.qfrc_constraint[robot_x_dof], data.qfrc_constraint[robot_y_dof]]
+                    [
+                        data.qfrc_constraint[robot_x_dof],
+                        data.qfrc_constraint[robot_y_dof],
+                    ]
                 )
                 f_obj = -f_on_robot
                 obj_xy = data.xpos[object_body, 0:2]
                 rob_xy = data.xpos[robot_body, 0:2]
                 r = rob_xy - obj_xy
                 tau = r[0] * f_obj[1] - r[1] * f_obj[0]
-                wrench = jnp.array([f_obj[0], f_obj[1], tau])
-                wrench = jnp.clip(wrench, -wrench_clip, wrench_clip)
-                return data, (wrench, rob_xy)
+                wrench = jnp.clip(
+                    jnp.array([f_obj[0], f_obj[1], tau]), -wrench_clip, wrench_clip
+                )
+                obj_pose = pose_t
+                return data, (wrench, rob_xy, obj_pose)
 
-            _, (wrenches, paths) = jax.lax.scan(
+            _, (wrenches, paths, obj_poses) = jax.lax.scan(
                 horizon_step, data, (u_seq, ref_poses)
             )
-            return wrenches, paths
+            return wrenches, paths, obj_poses
 
-        batched = jax.vmap(single_rollout, in_axes=(0, None, None))
-        return jax.jit(batched)
+        return jax.jit(jax.vmap(single_rollout, in_axes=(0, None, None)))
+
+    def _compile_coupled_rollout(self):
+        model = self.mjx_model
+        n_sub = self.n_substeps
+        robot_qadr = self._robot_qadr
+        object_qadr = self._object_qadr
+        robot_x_dof = self._robot_x_dof
+        robot_y_dof = self._robot_y_dof
+        object_body = self._object_body
+        robot_body = self._robot_body
+        wrench_clip = self._wrench_clip
+
+        def single_rollout(u_seq, ref_poses, robot_pos0):
+            data0 = mjx.make_data(model)
+            pose0 = ref_poses[0]
+            qpos = data0.qpos
+            qpos = qpos.at[object_qadr : object_qadr + 3].set(pose0)
+            qpos = qpos.at[robot_qadr : robot_qadr + 2].set(robot_pos0)
+            data = data0.replace(qpos=qpos)
+
+            def horizon_step(data, u_t):
+                data = data.replace(ctrl=u_t)
+
+                def substep(d, _):
+                    return mjx.step(model, d), None
+
+                data, _ = jax.lax.scan(substep, data, None, length=n_sub)
+                f_on_robot = jnp.array(
+                    [
+                        data.qfrc_constraint[robot_x_dof],
+                        data.qfrc_constraint[robot_y_dof],
+                    ]
+                )
+                f_obj = -f_on_robot
+                obj_xy = data.xpos[object_body, 0:2]
+                rob_xy = data.xpos[robot_body, 0:2]
+                r = rob_xy - obj_xy
+                tau = r[0] * f_obj[1] - r[1] * f_obj[0]
+                wrench = jnp.clip(
+                    jnp.array([f_obj[0], f_obj[1], tau]), -wrench_clip, wrench_clip
+                )
+                obj_pose = data.qpos[object_qadr : object_qadr + 3]
+                return data, (wrench, rob_xy, obj_pose)
+
+            _, (wrenches, paths, obj_poses) = jax.lax.scan(horizon_step, data, u_seq)
+            return wrenches, paths, obj_poses
+
+        return jax.jit(jax.vmap(single_rollout, in_axes=(0, None, None)))
 
     def seed(self, object_pose: np.ndarray, robot_pos: np.ndarray) -> None:
         raise RuntimeError("seed is only valid on the execution engine")
@@ -165,17 +239,21 @@ class MjxPlanningEngine(PhysicsEngine2D):
         ref_poses: np.ndarray,
         robot_pos0: np.ndarray,
         dt: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        del dt  # physics timestep baked into MJCF from cfg["dt"] / n_substeps
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        del dt
         u_seq = _clip_speed(np.asarray(u_seq, dtype=float), self.vmax)
         ref_poses = np.asarray(ref_poses, dtype=float)
         robot_pos0 = np.asarray(robot_pos0, dtype=float).reshape(2)
-        wrenches, paths = self._jitted_rollout(
+        wrenches, paths, obj_poses = self._jitted_rollout(
             jnp.asarray(u_seq),
             jnp.asarray(ref_poses),
             jnp.asarray(robot_pos0),
         )
-        return np.asarray(wrenches, dtype=float), np.asarray(paths, dtype=float)
+        return (
+            np.asarray(wrenches, dtype=float),
+            np.asarray(paths, dtype=float),
+            np.asarray(obj_poses, dtype=float),
+        )
 
 
 class MjxExecutionEngine(PhysicsEngine2D):
@@ -188,7 +266,9 @@ class MjxExecutionEngine(PhysicsEngine2D):
     ) -> None:
         self.cfg = cfg
         self.vmax = float(cfg.get("robot_max_speed", 1.0))
-        self.n_substeps = max(int(cfg.get("mjx_n_substeps", cfg.get("n_contact_substeps", 4))), 1)
+        self.n_substeps = max(
+            int(cfg.get("mjx_n_substeps", cfg.get("n_contact_substeps", 4))), 1
+        )
         self.z = 0.05
 
         xml = build_execution_xml(cfg, obstacles)
@@ -253,7 +333,7 @@ class MjxExecutionEngine(PhysicsEngine2D):
         ref_poses: np.ndarray,
         robot_pos0: np.ndarray,
         dt: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         raise RuntimeError("rollout_batch is only valid on the planning engine")
 
 
@@ -262,7 +342,7 @@ def build_mjx_engine_pair(
     object_: QuasiStaticObject2D,
     obstacles: list[BaseSDF],
 ) -> EnginePair:
-    del object_  # geometry comes from canonical T in MJCF
+    del object_
     return EnginePair(
         planning=MjxPlanningEngine(cfg, obstacles),
         execution=MjxExecutionEngine(cfg, obstacles),

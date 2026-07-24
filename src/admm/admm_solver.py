@@ -33,7 +33,13 @@ class ADMMSolver:
         self.rng = rng or np.random.default_rng(int(cfg.get("random_seed", 0)))
 
         h = int(cfg["horizon"])
-        self.consensus = WrenchConsensus(h, float(cfg["rho"]), float(cfg["max_dual"]))
+        cons_cfg = cfg.get("consensus") or {}
+        self.consensus = WrenchConsensus(
+            h,
+            float(cfg["rho"]),
+            float(cfg["max_dual"]),
+            dim=int(cons_cfg.get("dim", 3)),
+        )
         self.estimator = ContactPointEstimator(object_, obstacles, goal, cfg, self.rng)
         self.object_sp = ObjectSubproblem(
             object_, obstacles, goal, cfg, self.consensus, self.rng
@@ -48,6 +54,7 @@ class ADMMSolver:
             self.consensus,
             self.rng,
             planning_engine=self.planning_engine,
+            goal=self.goal,
         )
 
         q0 = object_.body_frame_point(self.robot_pos, object_.pose)
@@ -94,12 +101,8 @@ class ADMMSolver:
         p_world = pose0[:2] + rotate(pose0[2], p0)
         gap = p_world - self.robot_pos
         gap_norm = np.linalg.norm(gap)
-        # robot_radius only describes real collision geometry for the MJX
-        # backend (a sphere) -- the analytical backend's robot is a
-        # dimensionless point (see KinematicRobot2D / resolve_contact), so
-        # folding robot_radius into the seek-gap/speed logic there doesn't
-        # match that backend's own physics and was an unintended side effect
-        # of adding MJX parity. See CODE_CHANGES_LOG.md.
+        # Analytical contact treats the robot as a point; MJX uses a sphere
+        # of radius robot_radius — seek gap only folds in radius for MJX.
         is_mjx = str(self.cfg.get("physics_backend", "analytical")).lower() == "mjx"
         if is_mjx:
             seek_gap = max(
@@ -199,13 +202,18 @@ class ADMMSolver:
             "dual_norm_obj": float(np.linalg.norm(self.gamma_o)),
             "dual_norm_rob": float(np.linalg.norm(self.gamma_r)),
             "dual_saturated": bool(
-                np.any(np.abs(self.gamma_o) >= float(self.cfg["max_dual"]) - 1e-9)
-                or np.any(np.abs(self.gamma_r) >= float(self.cfg["max_dual"]) - 1e-9)
+                np.isfinite(float(self.cfg["max_dual"]))
+                and (
+                    np.any(np.abs(self.gamma_o) >= float(self.cfg["max_dual"]) - 1e-9)
+                    or np.any(np.abs(self.gamma_r) >= float(self.cfg["max_dual"]) - 1e-9)
+                )
             ),
             "obj_task_cost": float(obj_diag.get("obj_task_cost", 0.0)),
             "obj_admm_penalty": float(obj_diag.get("obj_admm_penalty", 0.0)),
             "rob_effort_cost": float(rob_diag.get("rob_effort_cost", 0.0)),
             "rob_admm_penalty": float(rob_diag.get("rob_admm_penalty", 0.0)),
+            "rob_coupling_cost": float(rob_diag.get("rob_coupling_cost", 0.0)),
+            "rob_goal_cost": float(rob_diag.get("rob_goal_cost", 0.0)),
             "contact_samples_pc": obj_diag.get(
                 "contact_samples_pc", np.zeros((0, 2))
             ),

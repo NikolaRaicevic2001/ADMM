@@ -42,12 +42,13 @@ ADMM/
 | Path | Role |
 |------|------|
 | `main_mpc.py` | Loads YAML config, builds a named scenario (`clutter` / `corridor` / `gate`), runs `ADMMSolver`, writes overview / plan comparison / residual plots and an optional diagnostic GIF under `results/`. |
-| `config/base_config.yaml` | Hyperparameters including `physics_backend: analytical \| mjx` (default analytical). |
+| `config/base_config.yaml` | Hyperparameters including `physics_backend: analytical \| mjx`, `robot_rollout_mode`, coupling weights. |
+| `docs/sim_assumptions.md` | Mapping to ICRA26 Alg. 4 (intentional diffs: contact \(U^o\), implied \(\ell_c\), freeze vs coupled). |
 | `src/geometry/` | Analytical 2D SDFs; T-shape from `t_shape_vertices()`. |
 | `src/dynamics/object_2d.py` | `QuasiStaticObject2D` limit-surface model used by **object MPPI**. |
 | `src/dynamics/physics_engine.py` | `PhysicsEngine2D` ABC + `EnginePair` factory: NumPy-only `seed` / `step_execution` / `rollout_batch`. |
 | `src/dynamics/analytical_engine.py` | SDF contact adapter wrapping `simulate_contact_step`. |
-| `src/dynamics/mjx_scene.py` | MJCF builders for planning (mocap weld) and execution (`frictionloss`) worlds. |
+| `src/dynamics/mjx_scene.py` | MJCF builders for frozen planning (mocap weld), coupled planning, and execution. |
 | `src/dynamics/mjx_engine.py` | MJX backend: JIT `vmap`×`scan` planning rollouts; NumPy boundary for ADMM. |
 | `src/dynamics/robot_2d.py` | Reference kinematic robot model (ADMM path uses the physics engine). |
 | `src/dynamics/obstacles.py` | Hinge obstacle costs and SDF push-out helpers. |
@@ -56,19 +57,18 @@ ADMM/
 | `src/mppi/` | Shared MPPI core + Gaussian sampler. |
 | `src/admm/` | Wrench consensus, object/robot subproblems, `ADMMSolver`. |
 | `src/utils/` | Config, environments, visualization, math helpers. |
-| `tests/` | SDF, wrench, consensus, envs, MPPI, MJX verification matrix. |
+| `tests/` | SDF, wrench, consensus, envs, MPPI, MJX + robot coupling tests. |
 
 ### Physics backends
 
-- **Default:** `physics_backend: analytical` (fast SDF contact via `simulate_contact_step`).
-- Set `physics_backend: mjx` for MuJoCo MJX batched robot contact + execution (GPU preferred; CPU works).
+- Set `physics_backend: analytical` (SDF contact) or `mjx` (MuJoCo MJX; GPU preferred).
 - **Object MPPI** always stays analytical ($x^+=x+\Delta t\,(D\odot w)$).
-- **Algorithm ↔ simulator contract** (NumPy only; no JAX types leak upward):
-  - `rollout_batch(u_seq, ref_poses, robot_pos0, dt) → wrenches, paths` for robot MPPI
+- **Algorithm ↔ simulator contract** (NumPy only):
+  - `rollout_batch(...) → wrenches, paths, object_poses` for robot MPPI
   - `seed` + `step_execution(u, dt) → pose, robot` for the MPC plant
-- **Dual engines (mjx):** Planning = dynamic object **welded to mocap** + velocity-actuated planar finger (JIT `vmap`/`scan`). Execution = planar object with joint `frictionloss` (tabletop) + velocity-actuated finger. Soft contacts via `solref`/`solimp` (no CPU SDF inside the XLA kernel).
-- CoM wrench from fixed-size contact sensors (`reduce=maxforce`); force on object = −force on robot.
-- Roadmap: MJX → NVIDIA Warp implementing the same `PhysicsEngine2D` ABC.
+- **`robot_rollout_mode`:** `frozen` (default; object follows $x^{o,\mathrm{ref}}$) or `coupled` (object moves under contact). Soft \(\ell_c\) defaults to **implied** poses from $D\odot\hat w^r$ vs $x^{o*}$ (`w_c_pos`, `w_c_theta`).
+- **MJX frozen:** mocap-welded object + velocity finger. **MJX coupled / execution:** planar `frictionloss` object + velocity finger.
+- See [`docs/sim_assumptions.md`](docs/sim_assumptions.md). Roadmap: Warp behind the same ABC.
 
 ### Control-flow sketch
 
@@ -215,7 +215,7 @@ s = \rho\,(Z^+ - Z),\qquad
 \text{stop if }\|r\|_2\le\varepsilon_r\ \text{and}\ \|s\|_2\le\varepsilon_s.
 $$
 
-Defaults: $\rho=1$, $\gamma_{\max}=\texttt{max\_dual}=4$, $\varepsilon_r=\varepsilon_s=1$, at most `n_admm=6` iterations per control step.
+Defaults: $\rho=1$, $\gamma_{\max}=\texttt{max\_dual}=15$, $\varepsilon_r=\varepsilon_s=0.5$, at most `n_admm=12` iterations per control step. Primary agreement diagnostic: $\|W^o-W^r\|$ in telemetry.
 
 **Horizon warm-start (MPC advance):** every sequence (controls, $Z$, duals) is shifted forward and the new terminal slot is zeroed:
 
@@ -263,16 +263,22 @@ The resulting nominal actions are projected back onto the boundary / friction co
 
 **Sampling.** $K_r$ velocity sequences with additive Gaussian noise of std $\Sigma^r=\texttt{sigma\_robot}$ (annealed by distance-to-goal).
 
-**Rollout.** Against the **frozen** object reference poses from the object subproblem, each sample is integrated with `simulate_contact_step(..., freeze_object=True)`. The realized wrench at each step is the mean over `n_contact_substeps` contact substeps. There is **no** SE(2) goal cost on the robot — matching $Z$ through contact is the task.
+**Rollout.** Default `robot_rollout_mode: frozen` holds the object on $x^{o,\mathrm{ref}}$ while resolving contact (analytical or MJX). `coupled` lets the object move. Realized wrenches $\hat W^r$ come from the planning engine.
 
-**Cost:**
+**Cost** (hybrid ICRA26 \(\ell_c\)): ADMM wrench penalty plus soft pose coupling. By default `ell_c_source: implied` integrates $\hat W^r$ with $D$ and penalizes distance to $x^{o*}$:
 
 $$
+\begin{aligned}
 J^r
-= r_r\sum_{t=0}^{H-1}\|u^r_t\|_2^2
-+ \sum_{t=0}^{H-1}\ell_{\mathrm{obs}}^{\mathrm{robot}}(p^r_t)
-+ \frac{\rho}{2}\|W^r - Z + \Gamma^r\|_F^2.
+&= r_r\sum_{t}\|u^r_t\|_2^2
++ \sum_{t}\ell_{\mathrm{obs}}^{\mathrm{robot}}(p^r_t)
++ \frac{\rho}{2}\|W^r - Z + \Gamma^r\|_F^2 \\
+&\quad + \sum_{t}\ell_c\!\bigl(x^{\mathrm{imp}}_t,\, x^{o*}_t\bigr)
++ \sum_{t}\ell_o^{\mathrm{rob}}\!\bigl(x^{\mathrm{imp}}_t,\, x^\star\bigr),
+\end{aligned}
 $$
+
+with $x^{\mathrm{imp}}$ from $x^+=x+\Delta t\,(D\odot\hat w^r)$ and $\ell_o^{\mathrm{rob}}$ weights defaulting to zero. See [`docs/sim_assumptions.md`](docs/sim_assumptions.md).
 
 #### 7. Execution and seek-to-contact
 
@@ -302,12 +308,12 @@ $$
 
 | Group | Defaults |
 |-------|----------|
-| Timing | $\Delta t=0.05$, $H=15$, `n_admm=6`, up to 500 control steps |
+| Timing | $\Delta t=0.05$, $H=15$, `n_admm=12`, up to 500 control steps |
 | Samples | $K_o=K_r=64$, $\nu_o=\nu_r=1$ |
 | Physics | $\mu=0.4$, $\mu_c=0.5$, $m=2$, $g=9.81$, $c=1$, $r=0.06$, $f_{\max}=4$ |
-| ADMM | $\rho=1$, $\gamma_{\max}=4$, $\varepsilon_r=\varepsilon_s=1$ |
-| Costs | $q_{\mathrm{pos}}=40$, $q_\theta=10$, $q^f_{\mathrm{pos}}=150$, $q^f_\theta=45$, $r_o=0.01$, $r_r=0.05$, $w_{\mathrm{obs}}=6\cdot 10^4$ |
-| Goal | position tol $0.06\,\mathrm{m}$, angle tol $0.08\,\mathrm{rad}$ |
+| ADMM | $\rho=1$, $\gamma_{\max}=15$, $\varepsilon_r=\varepsilon_s=0.5$ |
+| Costs | $q_{\mathrm{pos}}=40$, $q_\theta=10$, $q^f_{\mathrm{pos}}=300$, $q^f_\theta=90$, $r_o=0.01$, $r_r=0.05$, $w_{\mathrm{obs}}=6\cdot 10^4$, $w_{c,\mathrm{pos}}=20$, $w_{c,\theta}=5$ |
+| Goal | position tol $0.06\,\mathrm{m}$, angle tol $0.10\,\mathrm{rad}$ |
 
 ---
 

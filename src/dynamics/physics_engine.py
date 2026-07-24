@@ -18,7 +18,7 @@ from geometry.base_sdf import BaseSDF
 
 @dataclass
 class EnginePair:
-    """Planning (ref-pose object) + execution (coupled plant) worlds."""
+    """Planning (ref-pose or coupled) + execution (coupled plant) worlds."""
 
     planning: "PhysicsEngine2D"
     execution: "PhysicsEngine2D"
@@ -51,7 +51,7 @@ class PhysicsEngine2D(ABC):
         ref_poses: np.ndarray,
         robot_pos0: np.ndarray,
         dt: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Planning MPPI rollouts. Pure from the caller's perspective.
 
@@ -64,6 +64,7 @@ class PhysicsEngine2D(ABC):
         Returns:
             wrenches: (K, H, 3) world CoM wrenches [fx, fy, tau]
             paths: (K, H, 2) robot position trajectories
+            object_poses: (K, H, 3) object poses (ref-tiled if frozen; live if coupled)
         """
 
 

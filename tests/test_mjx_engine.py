@@ -99,7 +99,7 @@ def test_planning_contact_wrench_sign(engines, cfg_mjx):
     r0 = sc.object_.pose[:2] + np.array([0.12, 0.03])
     u = np.zeros((1, 6, 2))
     u[0, :, 0] = -0.3
-    wrenches, paths = pair.planning.rollout_batch(u, ref, r0, dt)
+    wrenches, paths, _obj = pair.planning.rollout_batch(u, ref, r0, dt)
     assert wrenches.shape == (1, 6, 3)
     assert paths.shape == (1, 6, 2)
     assert np.isfinite(wrenches).all()
@@ -125,13 +125,13 @@ def test_planning_contact_wrench_sign_mirrors_with_approach_direction(engines, c
     r0_right = sc.object_.pose[:2] + np.array([0.12, 0.03])
     u_left = np.zeros((1, 6, 2))
     u_left[0, :, 0] = -0.3
-    w_from_right, _ = pair.planning.rollout_batch(u_left, ref, r0_right, dt)
+    w_from_right, _, _ = pair.planning.rollout_batch(u_left, ref, r0_right, dt)
 
     # Mirror: approach from the left, push right.
     r0_left = sc.object_.pose[:2] + np.array([-0.12, 0.03])
     u_right = np.zeros((1, 6, 2))
     u_right[0, :, 0] = 0.3
-    w_from_left, _ = pair.planning.rollout_batch(u_right, ref, r0_left, dt)
+    w_from_left, _, _ = pair.planning.rollout_batch(u_right, ref, r0_left, dt)
 
     fx_from_right = float(np.mean(w_from_right[0, 2:, 0]))
     fx_from_left = float(np.mean(w_from_left[0, 2:, 0]))
@@ -144,9 +144,10 @@ def test_rollout_batch_shapes(engines, cfg_mjx):
     k, h = 3, 4
     u = np.zeros((k, h, 2))
     ref = np.tile(sc.object_.pose, (h, 1))
-    w, p = pair.planning.rollout_batch(u, ref, sc.robot_pos, float(cfg_mjx["dt"]))
+    w, p, obj = pair.planning.rollout_batch(u, ref, sc.robot_pos, float(cfg_mjx["dt"]))
     assert w.shape == (k, h, 3)
     assert p.shape == (k, h, 2)
+    assert obj.shape == (k, h, 3)
 
 
 def test_planning_rejects_execution_api(engines):
@@ -184,3 +185,21 @@ def test_admm_control_step_mjx_smoke(cfg_mjx):
     u0, residuals, plan = solver.control_step()
     assert np.isfinite(u0).all()
     assert "telemetry" in plan
+    assert "rob_coupling_cost" in plan["telemetry"]
+
+
+def test_mjx_coupled_rollout_shapes(cfg_mjx):
+    cfg = dict(cfg_mjx)
+    cfg["robot_rollout_mode"] = "coupled"
+    sc = build_scenario(cfg, "clutter")
+    pair = build_engine_pair(cfg, sc.object_, sc.obstacles)
+    h = 4
+    ref = np.tile(sc.object_.pose, (h, 1))
+    u = np.zeros((2, h, 2))
+    u[:, :, 0] = -0.2
+    r0 = sc.object_.pose[:2] + np.array([0.12, 0.03])
+    w, p, obj = pair.planning.rollout_batch(u, ref, r0, float(cfg["dt"]))
+    assert w.shape == (2, h, 3)
+    assert p.shape == (2, h, 2)
+    assert obj.shape == (2, h, 3)
+    assert np.isfinite(obj).all()

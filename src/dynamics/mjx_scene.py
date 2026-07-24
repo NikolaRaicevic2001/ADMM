@@ -211,6 +211,13 @@ def build_execution_xml(cfg: dict[str, Any], obstacles: list[BaseSDF]) -> str:
 """.strip()
 
 
+def build_coupled_planning_xml(cfg: dict[str, Any], obstacles: list[BaseSDF]) -> str:
+    """Coupled planning: same plant as execution (dynamic planar object, no mocap weld)."""
+    return build_execution_xml(cfg, obstacles).replace(
+        'model="admm_execution"', 'model="admm_coupled_planning"'
+    )
+
+
 def assert_t_shape_matches_analytical() -> None:
     """Sanity: convex boxes cover analytical outline AABB."""
     verts = t_shape_vertices()

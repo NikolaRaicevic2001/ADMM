@@ -19,9 +19,9 @@ limit_surface_r: 0.06
 
 f_max: 4.0
 rho: 1.0
-max_dual: 15.0   # gamma_max anti-windup (box clip per component)
-eps_r: 1.0
-eps_s: 1.0
+max_dual: 15.0   # gamma_max anti-windup (box clip per component); use .inf to disable
+eps_r: 0.5
+eps_s: 0.5
 
 # MPPI
 nu_o: 1.0        # object temperature
@@ -42,6 +42,13 @@ r_o: 0.01        # object wrench effort weight
 r_r: 0.05        # robot control effort weight
 w_obstacle: 60000.0
 obstacle_margin: 0.015
+# Robot soft coupling (ICRA26 ell_c) + optional light goal on implied object path
+w_c_pos: 20.0
+w_c_theta: 5.0
+w_rob_goal_pos: 0.0
+w_rob_goal_theta: 0.0
+ell_c_source: implied   # implied | live
+robot_rollout_mode: frozen  # frozen | coupled
 
 # Contact numerics
 contact_step_margin: 0.003
@@ -71,7 +78,7 @@ consensus:
   frame: world_com
 
 # Physics backend for robot contact + execution: analytical | mjx
-physics_backend: analytical
+physics_backend: mjx
 robot_radius: 0.012
 robot_mass: 1.0
 robot_max_speed: 0.6
@@ -81,5 +88,12 @@ mjx_solver_iterations: 20
 # Diagnostic GIF / logging
 telemetry_max_robot_rollouts: 24
 wrench_arrow_scale: 0.04
-# Static scene view: expand env AABB by this fraction (same axes every run)
 view_pad_frac: 0.28
+
+
+
+
+
+
+
+

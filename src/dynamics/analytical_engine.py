@@ -30,6 +30,12 @@ class AnalyticalPhysicsEngine(PhysicsEngine2D):
         self.cfg = cfg
         self.planning = planning
         self.robot_radius = float(cfg.get("robot_radius", 0.012))
+        mode = str(cfg.get("robot_rollout_mode", "frozen")).lower().strip()
+        if mode not in ("frozen", "coupled"):
+            raise ValueError(
+                f"Unknown robot_rollout_mode '{mode}'. Choose from: frozen, coupled"
+            )
+        self.rollout_mode = mode
         self._object_pose = object_.pose.copy()
         self._robot_pos = np.zeros(2)
 
@@ -62,25 +68,6 @@ class AnalyticalPhysicsEngine(PhysicsEngine2D):
                 rob = rob + (self.robot_radius - d + 1e-4) * n_world
         self._robot_pos = push_point_out_of_obstacles(rob, self.obstacles)
 
-    def _push_robot_clear_batch(
-        self, pose_batch: np.ndarray, rob_batch: np.ndarray
-    ) -> np.ndarray:
-        """Vectorized form of ``_push_robot_clear`` for a batch of (pose, robot_pos)
-        pairs. Same math as the scalar version above, applied to all samples in
-        one call instead of one Python-level call per sample (see
-        CODE_CHANGES_LOG.md — this batching is what makes ``rollout_batch``
-        fast; looping this per-sample was the root cause of a ~15-20x slowdown).
-        """
-        q = rotate(-pose_batch[:, 2], rob_batch - pose_batch[:, :2])
-        d, grad = self.object_.shape.sdf_and_grad(q)
-        n_world = rotate(pose_batch[:, 2], grad)
-        n_norm = np.linalg.norm(n_world, axis=-1, keepdims=True)
-        n_world = np.where(n_norm > 1e-12, n_world / np.clip(n_norm, 1e-12, None), 0.0)
-        needs_push = (d < self.robot_radius)[:, None]
-        push_dist = (self.robot_radius - d)[:, None] + 1e-4
-        rob_pushed = rob_batch + np.where(needs_push, push_dist * n_world, 0.0)
-        return push_point_out_of_obstacles(rob_pushed, self.obstacles)
-
     def seed(self, object_pose: np.ndarray, robot_pos: np.ndarray) -> None:
         self._object_pose = np.asarray(object_pose, dtype=float).reshape(3).copy()
         self._robot_pos = np.asarray(robot_pos, dtype=float).reshape(2).copy()
@@ -90,13 +77,6 @@ class AnalyticalPhysicsEngine(PhysicsEngine2D):
     ) -> tuple[np.ndarray, np.ndarray]:
         if self.planning:
             raise RuntimeError("step_execution is only valid on the execution engine")
-        # Not calling _push_robot_clear() here: this step didn't exist in the
-        # original (pre-MJX-refactor) analytical execution path, and adding
-        # it changed the validated closed-loop behavior as an unintended
-        # side effect of introducing robot_radius for MJX parity. See
-        # CODE_CHANGES_LOG.md. simulate_contact_step's own internal
-        # collision-safety logic (displacement capping, obstacle push-out)
-        # is unaffected and still applies.
         new_pose, new_robot, _ = simulate_contact_step(
             self.object_,
             self._object_pose,
@@ -115,7 +95,7 @@ class AnalyticalPhysicsEngine(PhysicsEngine2D):
         ref_poses: np.ndarray,
         robot_pos0: np.ndarray,
         dt: float,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if not self.planning:
             raise RuntimeError("rollout_batch is only valid on the planning engine")
         u_seq = np.asarray(u_seq, dtype=float)
@@ -124,33 +104,45 @@ class AnalyticalPhysicsEngine(PhysicsEngine2D):
         k, h, _ = u_seq.shape
         wrenches_out = np.zeros((k, h, 3))
         paths_out = np.zeros((k, h, 2))
-        params = self._params(freeze_object=True)
+        obj_out = np.zeros((k, h, 3))
+        freeze = self.rollout_mode == "frozen"
+        params = self._params(freeze_object=freeze)
 
-        # Batched across all k samples per horizon step (not per-sample) —
-        # simulate_contact_step and everything under it already support a
-        # batched leading dimension. See CODE_CHANGES_LOG.md.
         rob = np.tile(robot_pos0, (k, 1))
-        for t in range(h):
-            pose_t = np.tile(np.asarray(ref_poses[t], dtype=float).reshape(3), (k, 1))
-            # Not calling _push_robot_clear_batch() here -- see the matching
-            # note in step_execution() above; this step didn't exist in the
-            # original (pre-MJX-refactor) rollout and changed validated
-            # behavior as an unintended side effect. Kept as a method (used
-            # nowhere now) rather than deleted, in case robot_radius-aware
-            # push-out is deliberately wanted back for the analytical
-            # backend later.
-            _, new_robot, wrench = simulate_contact_step(
-                self.object_,
-                pose_t,
-                rob,
-                u_seq[:, t],
-                float(dt),
-                **params,
-            )
-            wrenches_out[:, t] = np.asarray(wrench).reshape(k, 3)
-            paths_out[:, t] = np.asarray(new_robot).reshape(k, 2)
-            rob = paths_out[:, t].copy()
-        return wrenches_out, paths_out
+        if freeze:
+            for t in range(h):
+                pose_t = np.tile(
+                    np.asarray(ref_poses[t], dtype=float).reshape(3), (k, 1)
+                )
+                _, new_robot, wrench = simulate_contact_step(
+                    self.object_,
+                    pose_t,
+                    rob,
+                    u_seq[:, t],
+                    float(dt),
+                    **params,
+                )
+                wrenches_out[:, t] = np.asarray(wrench).reshape(k, 3)
+                paths_out[:, t] = np.asarray(new_robot).reshape(k, 2)
+                obj_out[:, t] = pose_t
+                rob = paths_out[:, t].copy()
+        else:
+            pose = np.tile(np.asarray(ref_poses[0], dtype=float).reshape(3), (k, 1))
+            for t in range(h):
+                new_pose, new_robot, wrench = simulate_contact_step(
+                    self.object_,
+                    pose,
+                    rob,
+                    u_seq[:, t],
+                    float(dt),
+                    **params,
+                )
+                wrenches_out[:, t] = np.asarray(wrench).reshape(k, 3)
+                paths_out[:, t] = np.asarray(new_robot).reshape(k, 2)
+                obj_out[:, t] = np.asarray(new_pose).reshape(k, 3)
+                pose = obj_out[:, t].copy()
+                rob = paths_out[:, t].copy()
+        return wrenches_out, paths_out, obj_out
 
 
 def build_analytical_engine_pair(

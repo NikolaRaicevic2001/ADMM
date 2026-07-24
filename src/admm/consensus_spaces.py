@@ -32,9 +32,19 @@ class BaseConsensusSpace(ABC):
 class WrenchConsensus(BaseConsensusSpace):
     """World-frame CoM wrench consensus; arrays shaped (H, 3)."""
 
-    def __init__(self, horizon: int, rho: float, max_dual: float = 10.0) -> None:
+    def __init__(
+        self,
+        horizon: int,
+        rho: float,
+        max_dual: float = 10.0,
+        dim: int = 3,
+    ) -> None:
         self.H = horizon
-        self.dim = 3
+        self.dim = int(dim)
+        if self.dim != 3:
+            raise ValueError(
+                f"WrenchConsensus currently supports dim=3 only (got {self.dim})"
+            )
         self.rho = float(rho)
         self.max_dual = float(max_dual)
 
@@ -58,4 +68,6 @@ class WrenchConsensus(BaseConsensusSpace):
         self, actual_w: np.ndarray, z: np.ndarray, dual: np.ndarray
     ) -> np.ndarray:
         new_dual = dual + (actual_w - z)
+        if not np.isfinite(self.max_dual):
+            return new_dual
         return np.clip(new_dual, -self.max_dual, self.max_dual)
